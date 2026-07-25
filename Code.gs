@@ -92,6 +92,26 @@
  *      for all dates" registry) is matched case/whitespace-insensitively
  *      via normalizeNameKey() — "Jane Smith" and "jane smith " are the same
  *      person. The Name column itself still displays exactly as typed.
+ *    - RESUBMISSIONS ARE APPLIED, NOT DROPPED: buildRegistrantRow() keys
+ *      identity on Event_ID+Name+Person_Type, same as before, but now also
+ *      tracks each row's Party_ID (the originating Response ID). A response
+ *      re-seen under the SAME Party_ID (an edit via the "edit response"
+ *      link — see setAllowResponseEdits(true) above) patches that one row
+ *      in place. A DIFFERENT Party_ID for the same identity — a genuinely
+ *      new submission — marks the old row Program_Status/Lunch_Status =
+ *      'Superseded' (kept, not deleted, with a note in Admin_Notes) and
+ *      inserts the new row as the live truth. 'Superseded' rows are
+ *      excluded from every active/waitlist count automatically, the same
+ *      way 'Cancelled' already was.
+ *    - CAPACITY IS VISIBLE ON THE FORM: whenever a capped session hits 0
+ *      Remaining_Seats, its date label on both roster grids gets a
+ *      CAPACITY_HINT_SUFFIX ("(FULL - Waitlist)") appended — see
+ *      buildCapacityHintsFromRegistryRows() / refreshFormCapacityLabelsForAllForms(),
+ *      called at the end of every syncRegistrations() once Remaining_Seats
+ *      is fresh. Converts silent waitlisting into something a respondent
+ *      actually sees before submitting. A plain hyphen is used (not the em
+ *      dash meal-hint separator) so stripMealHint() can strip both
+ *      unambiguously when matching a grid row back to its Event_ID.
  *    - Template forms are cached forever in Script Properties, keyed by
  *      TEMPLATE_VERSION — bump that constant whenever the template
  *      structure changes so existing cached forms don't silently drift out
@@ -165,7 +185,11 @@ const REGISTRANT_STATUS_COLORS = {
   'Cancelled': '#F4CCCC',
   'Waitlisted': '#FCE5CD',
   'Active': '#D9EAD3',
-  'Needed': '#D9EAD3'
+  'Needed': '#D9EAD3',
+  // A newer submission from the same person/event superseded this row — see
+  // buildRegistrantRow()/supersedeRegistrantRow(). Distinct grey (reused
+  // from NA_CELL_COLOR) so it reads as "historical," not cancelled/waitlisted.
+  'Superseded': '#E8E8E8'
 };
 
 const MANUAL_OVERRIDE_COLOR = '#D9D2E9';
@@ -182,8 +206,14 @@ const MANUAL_ENTRY_HEADER_COLOR = '#FFF2CC';
 const MANUAL_ENTRY_CELL_TINT = '#FFFCF0';
 
 const MANUAL_OVERRIDE_OPTIONS = ['Auto-Synced', 'Manually Edited', 'Manually Added'];
-const PROGRAM_STATUS_OPTIONS = ['Active', 'Waitlisted', 'Cancelled'];
-const LUNCH_STATUS_OPTIONS = ['Needed', 'No Lunch', 'Waitlisted', 'Cancelled'];
+// 'Superseded' marks a row from an identity (Event_ID + Name + Person_Type)
+// that has since submitted again under a different Party_ID — see
+// buildRegistrantRow(). It's deliberately excluded from every active/
+// waitlist count (scanRegistrants(), buildEventCountsFromRegistrants(),
+// buildDashboardRollup() all key off 'Active'/'Waitlisted' by name) without
+// needing any special-casing there.
+const PROGRAM_STATUS_OPTIONS = ['Active', 'Waitlisted', 'Cancelled', 'Superseded'];
+const LUNCH_STATUS_OPTIONS = ['Needed', 'No Lunch', 'Waitlisted', 'Cancelled', 'Superseded'];
 const EVENT_TYPE_OPTIONS = ['Fixed', 'Regular'];
 
 const LOCATION_COLOR_MAP = {
@@ -945,10 +975,22 @@ function computeStatus(activeCount, maxCapacity) {
   return '🟢 Open';
 }
 
-/** Strips the " — <shorthand/description>" menu hint appended by formatDateLabelWithMeal(), returning the plain date label. */
+/**
+ * Suffix appended by formatDateLabelWithMeal() when a capped session has
+ * hit 0 Remaining_Seats — converts silent waitlisting into something a
+ * respondent actually sees before submitting (see
+ * buildCapacityHintsFromRegistryRows() / refreshFormCapacityLabelsForAllForms()).
+ * Deliberately a plain hyphen, not the em dash " — " used for meal hints,
+ * so stripMealHint() can tell the two apart unambiguously.
+ */
+const CAPACITY_HINT_SUFFIX = ' (FULL - Waitlist)';
+
+/** Strips the CAPACITY_HINT_SUFFIX and/or the " — <shorthand/description>" menu hint appended by formatDateLabelWithMeal(), returning the plain date label. */
 function stripMealHint(label) {
-  const idx = String(label).indexOf(' — ');
-  return idx === -1 ? String(label) : String(label).substring(0, idx);
+  let s = String(label);
+  if (s.endsWith(CAPACITY_HINT_SUFFIX)) s = s.slice(0, -CAPACITY_HINT_SUFFIX.length);
+  const idx = s.indexOf(' — ');
+  return idx === -1 ? s : s.substring(0, idx);
 }
 
 /** Tints an Event_Date column's cells by month — the direct replacement for the old separate Month column everywhere. */
@@ -1005,39 +1047,69 @@ function getMealInfoForDate(date, location) {
 }
 
 /**
- * Builds a "date label + menu hint" string, e.g. "Mon, Jan 5, 2026 —
- * Turkey Sandwich", using Meal_Shorthand when present, falling back to
- * Meal_Description. When the date+location is marked "Not Serving," the
- * hint instead reads "No Lunch Served" — this is what lets a form
- * communicate the lack of catering right on the date row itself. Used ONLY
- * for form-facing display text; internal matching/storage always uses the
- * plain label via stripMealHint()/formatDateLabel().
+ * Builds a "date label + menu hint [+ capacity hint]" string, e.g. "Mon,
+ * Jan 5, 2026 — Turkey Sandwich (FULL - Waitlist)", using Meal_Shorthand
+ * when present, falling back to Meal_Description. When the date+location is
+ * marked "Not Serving," the hint instead reads "No Lunch Served" — this is
+ * what lets a form communicate the lack of catering right on the date row
+ * itself. capacityHint (CAPACITY_HINT_SUFFIX or '') is always appended
+ * LAST, after any meal hint. Used ONLY for form-facing display text;
+ * internal matching/storage always uses the plain label via
+ * stripMealHint()/formatDateLabel().
  */
-function formatDateLabelWithMeal(date, location) {
+function formatDateLabelWithMeal(date, location, capacityHint) {
   const baseLabel = formatDateLabel(date);
   const meal = getMealInfoForDate(date, location);
-  if (!meal) return baseLabel;
-  if (meal.type === 'Not Serving') return `${baseLabel} — No Lunch Served`;
-  const hint = meal.shorthand || meal.description;
-  return hint ? `${baseLabel} — ${hint}` : baseLabel;
+  let label;
+  if (!meal) label = baseLabel;
+  else if (meal.type === 'Not Serving') label = `${baseLabel} — No Lunch Served`;
+  else {
+    const hint = meal.shorthand || meal.description;
+    label = hint ? `${baseLabel} — ${hint}` : baseLabel;
+  }
+  return capacityHint ? `${label}${capacityHint}` : label;
 }
 
 /**
- * Splits a set of session dates into the full label list (for the "Select
- * Dates Attending" checkbox — every date, whether or not lunch is served)
- * and the lunch-grid label subset (only dates where Lunch_Schedule doesn't
- * mark that date+location "Not Serving") — so the lunch grid never offers
- * a choice on a day nothing is actually being catered.
+ * Splits a set of session dates into the full label list (for the
+ * attendance roster grid — every date, whether or not lunch is served) and
+ * the lunch-grid label subset (only dates where Lunch_Schedule doesn't mark
+ * that date+location "Not Serving") — so the lunch grid never offers a
+ * choice on a day nothing is actually being catered. capacityHints is an
+ * optional { 'yyyy-MM-dd': CAPACITY_HINT_SUFFIX } map (see
+ * buildCapacityHintsFromRegistryRows()) — omit it and no date gets a
+ * capacity hint.
  */
-function buildDateLabelSets(dates, locationName) {
-  const allDateLabels = dates.map(d => formatDateLabelWithMeal(d, locationName));
+function buildDateLabelSets(dates, locationName, capacityHints) {
+  capacityHints = capacityHints || {};
+  const allDateLabels = dates.map(d => formatDateLabelWithMeal(d, locationName, capacityHints[formatDateKey(d)]));
   const lunchDateLabels = dates
     .filter(d => {
       const meal = getMealInfoForDate(d, locationName);
       return !meal || meal.type !== 'Not Serving';
     })
-    .map(d => formatDateLabelWithMeal(d, locationName));
+    .map(d => formatDateLabelWithMeal(d, locationName, capacityHints[formatDateKey(d)]));
   return { allDateLabels, lunchDateLabels };
+}
+
+/**
+ * Builds { 'yyyy-MM-dd': CAPACITY_HINT_SUFFIX } from a batch of
+ * Master_Program_Dashboard rows (any set sharing the same header layout —
+ * typically one form's sessions), using each row's own Max_Capacity /
+ * Remaining_Seats. Uncapped sessions (no Max_Capacity) never get a hint.
+ */
+function buildCapacityHintsFromRegistryRows(rows, map) {
+  const hints = {};
+  rows.forEach(row => {
+    const d = coerceDate(row[map['Event_Date']]);
+    if (!d) return;
+    const rawCap = row[map['Max_Capacity']];
+    const isCapped = rawCap !== '' && rawCap !== '--' && Number(rawCap) > 0;
+    if (!isCapped) return;
+    const remaining = Number(row[map['Remaining_Seats']]);
+    if (!isNaN(remaining) && remaining <= 0) hints[formatDateKey(d)] = CAPACITY_HINT_SUFFIX;
+  });
+  return hints;
 }
 
 /**
@@ -1106,7 +1178,8 @@ function refreshFormsForChangedLunchDate(changedDate, location) {
     const datesForForm = formRows.map(row => coerceDate(row[map['Event_Date']])).filter(Boolean).sort((a, b) => a - b);
     if (datesForForm.length === 0) return;
 
-    const { allDateLabels, lunchDateLabels } = buildDateLabelSets(datesForForm, formLocation);
+    const capacityHints = buildCapacityHintsFromRegistryRows(formRows, map);
+    const { allDateLabels, lunchDateLabels } = buildDateLabelSets(datesForForm, formLocation, capacityHints);
     const lunchLabels = lunchDateLabels.length > 0 ? lunchDateLabels : ['No lunch served for any date on this form'];
     try {
       const form = FormApp.openById(formId);
@@ -2224,7 +2297,7 @@ function syncRegistrations() {
   const registryIndex = buildRegistryIndex(registrySheet);
   const existingRows = readAllSectionedRows(registrantsSheet, HEADERS.Lunch_and_Event_Registrants, 'Event_ID');
   const protectedKeys = getProtectedRegistrantKeys(existingRows);
-  const existingRowIndex = getExistingRegistrantKeys(existingRows);
+  const existingRowIndex = getExistingRegistrantIndex(existingRows);
 
   const formIds = getDistinctFormIds(registrySheet);
   const newRows = [];
@@ -2253,6 +2326,7 @@ function syncRegistrations() {
   renderRegistrantsSheet(false, combinedRegistrantRows);
 
   recomputeEventRegistryCounts(registrySheet, registrantsSheet);
+  refreshFormCapacityLabelsForAllForms(registrySheet);
 
   renderProgramDashboard();
   updateMasterLunchDashboard();
@@ -2314,12 +2388,19 @@ function getProtectedRegistrantKeys(rows) {
   return set;
 }
 
-/** Set of (Event_ID|normalized Name|Person_Type) keys already present, used to skip duplicate imports. */
-function getExistingRegistrantKeys(rows) {
+/**
+ * Map of (Event_ID|normalized Name|Person_Type) -> that row's live array,
+ * for every currently-present row (Superseded ones included — a further
+ * resubmission still needs to find and re-supersede the CURRENT row, not
+ * pile up duplicates). buildRegistrantRow() uses this both to skip true
+ * duplicate imports and to locate the row a resubmission should patch or
+ * supersede.
+ */
+function getExistingRegistrantIndex(rows) {
   const map = getIndexMap(HEADERS.Lunch_and_Event_Registrants);
-  const set = new Set();
-  rows.forEach(row => set.add(`${row[map['Event_ID']]}|${normalizeNameKey(row[map['Name']])}|${row[map['Person_Type']]}`));
-  return set;
+  const index = new Map();
+  rows.forEach(row => index.set(`${row[map['Event_ID']]}|${normalizeNameKey(row[map['Name']])}|${row[map['Person_Type']]}`, row));
+  return index;
 }
 
 /** Pulls a named item's response value out of a FormResponse. Loops ALL items sharing that title (a given title can appear on several branch-specific pages) and returns the first one that was actually part of this respondent's path. */
@@ -2535,6 +2616,21 @@ function applyAllDatesCatchup(registryIndex, protectedKeys, existingRowIndex, or
   });
 }
 
+/**
+ * Marks an existing registrant row as no longer current, WITHOUT deleting
+ * it — so staff can see a change actually happened rather than the row
+ * just vanishing. Applied when a genuinely different submission (a
+ * different Party_ID) shows up for the same Event_ID+Name+Person_Type.
+ */
+function supersedeRegistrantRow(row, map, supersededAt) {
+  if (row[map['Program_Status']] === 'Superseded') return; // already marked by an earlier resubmission this pass
+  row[map['Program_Status']] = 'Superseded';
+  row[map['Lunch_Status']] = 'Superseded';
+  const note = `Superseded by a newer submission on ${Utilities.formatDate(supersededAt, TIMEZONE, 'M/d/yyyy h:mm a')}.`;
+  const existingNotes = String(row[map['Admin_Notes']] || '').trim();
+  row[map['Admin_Notes']] = existingNotes ? `${existingNotes} | ${note}` : note;
+}
+
 function buildRegistrantRow(args) {
   const {
     registryEntry, name, personType, lunchType, primaryRegistrant, adminNotes, formEditUrl,
@@ -2543,8 +2639,36 @@ function buildRegistrantRow(args) {
   const displayName = String(name || '').trim();
   const key = `${registryEntry.eventId}|${normalizeNameKey(displayName)}|${personType}`;
 
-  if (protectedKeys.has(key) || existingRowIndex.has(key)) {
-    return null; // never overwrite manually-edited rows; skip duplicates already imported
+  if (protectedKeys.has(key)) {
+    return null; // never overwrite a manually-edited/added row, resubmission or not
+  }
+
+  const map = getIndexMap(HEADERS.Lunch_and_Event_Registrants);
+  const existingRow = existingRowIndex.get(key);
+
+  if (existingRow) {
+    const existingPartyId = existingRow[map['Party_ID']];
+    if (existingPartyId && existingPartyId === partyId) {
+      // Same Response ID — Google keeps a response's ID stable when a
+      // respondent uses their "edit response" link (see
+      // form.setAllowResponseEdits(true) in getOrCreateTemplateForm()), so
+      // this is the SAME submission being re-seen, not a new one. Refresh
+      // the one row in place rather than appending a duplicate.
+      existingRow[map['Lunch_Type']] = lunchType;
+      existingRow[map['Lunch_Status']] = existingRow[map['Program_Status']] === 'Waitlisted'
+        ? 'Waitlisted'
+        : (lunchType && lunchType !== 'No Lunch' ? 'Needed' : 'No Lunch');
+      existingRow[map['Admin_Notes']] = adminNotes || '';
+      existingRow[map['Party_Size']] = partySize || '';
+      existingRow[map['Order_Ahead_Flag']] = computeOrderAheadFlag(registryEntry.eventDate, submittedAt, orderAheadDays);
+      existingRow[map['Form_Source']] = makeHyperlinkFormula(formEditUrl, 'View Submission');
+      return null; // nothing new to append — the existing row was updated in place
+    }
+    // A genuinely different submission (a different Party_ID) for the same
+    // identity: keep the old row visible for the audit trail instead of
+    // silently dropping this resubmission the way a plain duplicate-key
+    // check used to.
+    supersedeRegistrantRow(existingRow, map, submittedAt);
   }
 
   const isCapped = registryEntry.maxCapacity > 0;
@@ -2555,10 +2679,8 @@ function buildRegistrantRow(args) {
     : (lunchType && lunchType !== 'No Lunch' ? 'Needed' : 'No Lunch');
 
   registryEntry.activeCountSoFar = (registryEntry.activeCountSoFar || 0) + (programStatus === 'Active' ? 1 : 0);
-  existingRowIndex.add(key); // reserve immediately so later rows in this same pass don't duplicate it
 
   const row = new Array(HEADERS.Lunch_and_Event_Registrants.length).fill('');
-  const map = getIndexMap(HEADERS.Lunch_and_Event_Registrants);
 
   row[map['Event_Date']] = registryEntry.eventDate;
   row[map['Manual_Override']] = 'Auto-Synced';
@@ -2576,6 +2698,8 @@ function buildRegistrantRow(args) {
   row[map['Order_Ahead_Flag']] = computeOrderAheadFlag(registryEntry.eventDate, submittedAt, orderAheadDays);
   row[map['Admin_Notes']] = adminNotes || '';
   row[map['Event_ID']] = registryEntry.eventId;
+
+  existingRowIndex.set(key, row); // reserve/replace immediately so a later row in this same pass supersedes/patches THIS one
   return row;
 }
 
@@ -2637,6 +2761,55 @@ function recomputeCountsForZone(registrySheet, dataStart, numRows, regMap, count
   registrySheet.getRange(dataStart, regMap['Waitlist_Count'], numRows, 1).setValues(waitlistOut);
   registrySheet.getRange(dataStart, regMap['Remaining_Seats'], numRows, 1).setValues(remainingOut);
   registrySheet.getRange(dataStart, regMap['Status'], numRows, 1).setValues(statusOut);
+}
+
+/**
+ * Call AFTER recomputeEventRegistryCounts() so Remaining_Seats is fresh.
+ * Re-stamps every capped form's roster-grid ROW labels with a
+ * CAPACITY_HINT_SUFFIX wherever a session has hit 0 Remaining_Seats — this
+ * is what turns silent waitlisting into a signal a respondent can actually
+ * see before they submit. Forms with no capped sessions at all are skipped
+ * entirely (nothing on them can ever go full), so this stays cheap on the
+ * common case of unlimited/"Regular" programs.
+ */
+function refreshFormCapacityLabelsForAllForms(registrySheet) {
+  const headers = HEADERS.Master_Program_Dashboard;
+  const rows = readAllSectionedRows(registrySheet, headers, 'Event_ID');
+  if (rows.length === 0) return;
+  const map = getIndexMap(headers);
+
+  const byForm = {};
+  rows.forEach(row => {
+    const formId = row[map['Form_ID']];
+    if (!formId) return;
+    if (!byForm[formId]) byForm[formId] = [];
+    byForm[formId].push(row);
+  });
+
+  Object.keys(byForm).forEach(formId => {
+    const formRows = byForm[formId];
+    const hasCappedSession = formRows.some(row => {
+      const rawCap = row[map['Max_Capacity']];
+      return rawCap !== '' && rawCap !== '--' && Number(rawCap) > 0;
+    });
+    if (!hasCappedSession) return; // nothing on this form can ever go FULL — skip the API round trip
+
+    const location = formRows[0][map['Location']];
+    const dates = formRows.map(r => coerceDate(r[map['Event_Date']])).filter(Boolean).sort((a, b) => a - b);
+    if (dates.length === 0) return;
+    const capacityHints = buildCapacityHintsFromRegistryRows(formRows, map);
+    const { allDateLabels, lunchDateLabels } = buildDateLabelSets(dates, location, capacityHints);
+    const lunchLabels = lunchDateLabels.length > 0 ? lunchDateLabels : ['No lunch served for any date on this form'];
+    try {
+      const form = FormApp.openById(formId);
+      form.getItems().filter(it => it.getTitle() === TEMPLATE_ITEM_TITLES.ATTENDANCE_GRID)
+        .forEach(it => it.asCheckboxGridItem().setRows(allDateLabels));
+      form.getItems().filter(it => it.getTitle() === TEMPLATE_ITEM_TITLES.LUNCH_GRID)
+        .forEach(it => it.asCheckboxGridItem().setRows(lunchLabels));
+    } catch (err) {
+      log(`⚠️ Could not refresh capacity labels on form ${formId} (${err}).`);
+    }
+  });
 }
 
 
@@ -2873,11 +3046,11 @@ function applyRegistrantsFormatting(sheet, headers, result) {
   const lunchRanges = activeZones.map(z => sheet.getRange(z.start, lunchCol, z.count, 1));
   const orderAheadRanges = activeZones.map(z => sheet.getRange(z.start, orderAheadCol, z.count, 1));
 
-  ['Cancelled', 'Waitlisted', 'Active'].forEach(text => {
+  ['Cancelled', 'Waitlisted', 'Active', 'Superseded'].forEach(text => {
     const rule = buildTextEqualsRuleForRanges(programRanges, text, REGISTRANT_STATUS_COLORS[text]);
     if (rule) rules.push(rule);
   });
-  ['Cancelled', 'Waitlisted', 'Needed'].forEach(text => {
+  ['Cancelled', 'Waitlisted', 'Needed', 'Superseded'].forEach(text => {
     const rule = buildTextEqualsRuleForRanges(lunchRanges, text, REGISTRANT_STATUS_COLORS[text]);
     if (rule) rules.push(rule);
   });
@@ -3021,6 +3194,7 @@ function triageDeletedSessions(sessionRows, map, registrantsSheet) {
 function refreshFormDateListsForForms(keptSessionRows, map, affectedFormIds) {
   const datesByForm = {};
   const locationByForm = {};
+  const rowsByForm = {};
   keptSessionRows.forEach(row => {
     const formId = row[map['Form_ID']];
     if (!formId || !affectedFormIds.has(formId)) return;
@@ -3029,12 +3203,15 @@ function refreshFormDateListsForForms(keptSessionRows, map, affectedFormIds) {
     if (!datesByForm[formId]) datesByForm[formId] = [];
     datesByForm[formId].push(d);
     if (!locationByForm[formId]) locationByForm[formId] = row[map['Location']];
+    if (!rowsByForm[formId]) rowsByForm[formId] = [];
+    rowsByForm[formId].push(row);
   });
 
   affectedFormIds.forEach(formId => {
     const dates = (datesByForm[formId] || []).sort((a, b) => a - b);
     const location = locationByForm[formId];
-    const { allDateLabels, lunchDateLabels } = buildDateLabelSets(dates, location);
+    const capacityHints = buildCapacityHintsFromRegistryRows(rowsByForm[formId] || [], map);
+    const { allDateLabels, lunchDateLabels } = buildDateLabelSets(dates, location, capacityHints);
     const attendanceLabels = allDateLabels.length > 0 ? allDateLabels : ['No upcoming dates'];
     const lunchLabels = lunchDateLabels.length > 0 ? lunchDateLabels : ['No upcoming dates'];
     try {
