@@ -145,9 +145,9 @@ function log(msg) {
 
 /** Calendar ID -> human-readable location name. */
 const CALENDAR_MAP = {
-  'c_abdd3adf5003b03fe953636a61771c2c5261f71f9520197e6dfc5d262cccc117@group.calendar.google.com': 'Narberth',
-  'c_33a79383882a214a9cab3cbbb0ce63fa459f5459d91e6e378c68e23aa75ed1b8@group.calendar.google.com': 'Ashbridge',
-  'c_c4d3d99412906aea447f6d2e6ed805c16ff9a3661a18fa3b2a4a891023ad4a64@group.calendar.google.com': 'Zoom'
+  'c_a1a2cd2f999f1bed82d1f21c59a1cb381485a28297a3ff1b8d394e2ad5fdc282@group.calendar.google.com': 'Narberth',
+  'c_e75805d7180c15888ed58e5625878088059c001053181bbaffceac8f6a64e1dd@group.calendar.google.com': 'Ashbridge',
+  'c_562b3332ef81d94b74100a3075f00d0f68061a01edcf46ea1378872c60d91c07@group.calendar.google.com': 'Zoom'
 };
 
 /**
