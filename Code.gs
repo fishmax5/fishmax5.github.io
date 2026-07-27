@@ -29,9 +29,9 @@
  *      "No Lunch Served" wherever it's shown. Also split into
  *      Upcoming/Past sub-tables like every other date-bearing tab.
  *    - Config                   : Meal Buffer Amounts (Location x Hot/Cold
- *      only — "Not Serving" never gets a buffer row) + Order Ahead Time.
- *      Unaffected by the Upcoming/Past split (it's a settings tab, not a
- *      per-date log).
+ *      only — "Not Serving" never gets a buffer row) + Order Ahead Time +
+ *      an optional Admin Notification Email. Unaffected by the
+ *      Upcoming/Past split (it's a settings tab, not a per-date log).
  *    - Deleted_Event_Triage     : same Upcoming/Past split + Event_Date
  *      first-column/month-tint treatment as Lunch_and_Event_Registrants.
  *
@@ -50,6 +50,33 @@
  *      modified/cancelled timed event in our tracked window). This requires
  *      the "Calendar" Advanced Service to be enabled on this Apps Script
  *      project (Editor -> Services -> + Calendar API) — see SETUP below.
+ *    - EVENT TITLE / DESCRIPTION GRAMMAR:
+ *        "Yoga Basics [Cap: 12]"  -> capacity 12; brackets are for capacity
+ *        "*Yoga Basics [Cap: 12]" -> TENTATIVE. A leading "*" means the
+ *          session isn't confirmed: no form is generated and no registry
+ *          row is written, until the asterisk comes off. parseEventTitle()
+ *          strips the asterisk from cleanTitle, and since computeEventId()
+ *          keys off cleanTitle, confirming an event later produces the
+ *          SAME Event_ID — it just flows through as a new session with no
+ *          reconciliation. (Re-adding an asterisk to an already-confirmed
+ *          event does NOT triage it; existing registrations are kept.)
+ *        Fixed-vs-Regular now comes from the event DESCRIPTION — put
+ *          "[Fixed]" there. A legacy "[... Fixed]" in the title still works
+ *          but logs a nudge; see isFixedSeries().
+ *    - REGISTRATION LINKS ARE PREFILLED with every roster-grid box checked
+ *      (buildPrefilledAllCheckedUrl) so the common "all of us, all dates"
+ *      case is read-and-submit and respondents just uncheck exceptions.
+ *      Forms has no default-checked grid, so a prefilled response URL is
+ *      the only way to do this; it falls back to the plain published URL if
+ *      it can't be built. See that function for the one soft edge.
+ *    - THE LUNCH DASHBOARD LISTS EVERY UPCOMING date x location even at
+ *      zero registrants, so staff can plan against (and hand-enter buffers
+ *      on) dates nobody has signed up for yet. Dates explicitly marked
+ *      "Not Serving" are excluded; past dates are never back-seeded.
+ *    - ADMIN NOTIFICATIONS: set an address in Config to get ONE digest per
+ *      sync covering only things needing a human — waitlisted registrants,
+ *      forms that couldn't be opened, events sent to triage. A sync with
+ *      nothing to report sends nothing. Blank address = disabled.
  *    - FIXED-SERIES FORMS now ask an "Attendance Mode" question up front:
  *      "Sign up for all dates" (one lunch choice per person, applied to
  *      every session automatically, including dates added to the series
@@ -331,9 +358,14 @@ const CONFIG_LAYOUT = {
     title: '⏰ Order Ahead Time',
     startCol: 6,
     headers: ['Order_Ahead_Days']
+  },
+  ADMIN_NOTIFICATIONS: {
+    title: '📧 Admin Notifications',
+    startCol: 8,
+    headers: ['Admin_Notification_Email']
   }
 };
-const CONFIG_SPACER_COLS = [5];
+const CONFIG_SPACER_COLS = [5, 7];
 const DEFAULT_MEAL_BUFFERS = { standardBufferAmount: 1, testerBufferAmount: 2 };
 const DEFAULT_ORDER_AHEAD_DAYS = 7;
 const CONFIG_HEADER_ROW = 2;
@@ -1104,6 +1136,7 @@ function buildTextEqualsRuleForRanges(ranges, text, bgColor) {
 let __mealInfoIndexCache = null;
 let __mealBufferIndexCache = null;
 let __orderAheadDaysCache = null;
+let __adminNotificationEmailCache = null;
 let __calendarEventsCache = null;
 let __formItemIndexCache = {};
 
@@ -1150,6 +1183,7 @@ function invalidateMealInfoIndex() {
 function invalidateConfigCaches() {
   __mealBufferIndexCache = null;
   __orderAheadDaysCache = null;
+  __adminNotificationEmailCache = null;
 }
 
 /**
@@ -1376,6 +1410,71 @@ function applyFormDateLabels(formId, attendanceLabels, lunchLabels, options) {
   __formLabelFingerprintDirty = true;
   invalidateFormItemIndex(formId); // cached grid row/column shapes for this form are now stale
   return true;
+}
+
+/**
+ * Builds a PREFILLED form URL with every box in both roster grids already
+ * checked — every person, every date — so the common "we're all coming to
+ * everything" case is a read-and-submit instead of a wall of empty
+ * checkboxes. Respondents uncheck the exceptions.
+ *
+ * Google Forms has no notion of a default-checked grid, so the only way to
+ * do this is a prefilled response URL; that URL is what we hand out as the
+ * registration link (calendar descriptions, the dashboard's "View Live
+ * Form"). It has to be regenerated whenever the grid rows change, which is
+ * exactly when the label writes happen.
+ *
+ * Prefill entries are emitted for EVERY guest-count branch's grids at once.
+ * Forms simply ignores the parameters for pages a given respondent never
+ * visits, so one URL covers all four branches.
+ *
+ * KNOWN SOFT EDGE: a prefill value only matches a row whose label is still
+ * byte-identical, so after refreshFormCapacityLabelsForAllForms() appends a
+ * "(FULL - Waitlist)" hint to a date, the already-published link stops
+ * pre-checking THAT date until the link is regenerated (next time the form
+ * gains/loses dates). Every other date still pre-checks, and a full sign-up
+ * is never wrong — just one box short of pre-filled. Regenerating on every
+ * capacity change would mean rewriting every calendar description on every
+ * sync, which costs far more than it saves.
+ *
+ * Returns null on any failure — callers fall back to the plain published
+ * URL, which is the pre-existing behavior and always works.
+ */
+function buildPrefilledAllCheckedUrl(form) {
+  try {
+    let response = form.createResponse();
+    let anyPrefilled = false;
+
+    form.getItems().forEach(item => {
+      const title = item.getTitle();
+      if (title !== TEMPLATE_ITEM_TITLES.ATTENDANCE_GRID && title !== TEMPLATE_ITEM_TITLES.LUNCH_GRID) return;
+      const grid = item.asCheckboxGridItem();
+      const rows = grid.getRows();
+      const columns = grid.getColumns();
+      if (rows.length === 0 || columns.length === 0) return;
+      // One entry per row: the full column list = every person checked.
+      const allChecked = rows.map(() => columns.slice());
+      try {
+        response = response.withItemResponse(grid.createResponse(allChecked));
+        anyPrefilled = true;
+      } catch (err) {
+        // A grid still holding a placeholder row, or otherwise not
+        // answerable — skip it rather than losing the whole URL.
+        log(`ℹ️ Skipped prefill for "${title}" on form ${form.getId()}: ${err}`);
+      }
+    });
+
+    if (!anyPrefilled) return null;
+    return response.toPrefilledUrl();
+  } catch (err) {
+    log(`⚠️ Could not build a prefilled all-checked URL for form ${form.getId()} (${err}) — falling back to the plain published URL.`);
+    return null;
+  }
+}
+
+/** The link we actually hand out: prefilled-all-checked when we can build one, plain published URL otherwise. */
+function buildRegistrationUrl(form) {
+  return buildPrefilledAllCheckedUrl(form) || form.getPublishedUrl();
 }
 
 
@@ -1680,7 +1779,8 @@ function styleConfigSheet(sheet) {
 
   seedMealBufferRows(sheet);
   seedOrderAheadRow(sheet);
-  invalidateConfigCaches(); // both seeds may have just written rows the caches were built from
+  seedAdminNotificationRow(sheet);
+  invalidateConfigCaches(); // the seeds above may have just written cells the caches were built from
 }
 
 /** Pre-fills the fixed Location x Hot/Cold combinations if they aren't already present. Never overwrites an existing combo's row. */
@@ -1714,6 +1814,21 @@ function seedOrderAheadRow(sheet) {
   if (cell.getValue() === '') {
     cell.setValue(DEFAULT_ORDER_AHEAD_DAYS);
     log(`Seeded default Order Ahead Time (${DEFAULT_ORDER_AHEAD_DAYS} days) on "${SHEET_NAMES.CONFIG}".`);
+  }
+}
+
+/**
+ * Leaves the admin email BLANK on purpose — an empty cell means "don't
+ * send anything," and guessing an address (the current user's, say) would
+ * start mailing someone who never asked for it. Just annotates the cell so
+ * it's obvious what goes there.
+ */
+function seedAdminNotificationRow(sheet) {
+  const section = CONFIG_LAYOUT.ADMIN_NOTIFICATIONS;
+  const cell = sheet.getRange(CONFIG_DATA_START_ROW, section.startCol);
+  if (String(cell.getValue() || '').trim() === '') {
+    cell.setNote('Optional. One address to receive a per-sync digest of items needing attention '
+      + '(waitlisted registrants, forms that failed to open, triaged deleted events). Leave blank to disable.');
   }
 }
 
@@ -1776,6 +1891,78 @@ function getOrderAheadDays() {
   return days;
 }
 
+/**
+ * The address in Config's "📧 Admin Notifications" section, or '' when
+ * blank — in which case notifyAdmin() silently does nothing, so leaving it
+ * empty is a perfectly valid way to turn notifications off.
+ */
+function getAdminNotificationEmail() {
+  if (__adminNotificationEmailCache !== null) return __adminNotificationEmailCache;
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss ? ss.getSheetByName(SHEET_NAMES.CONFIG) : null;
+  let email = '';
+  if (sheet) {
+    const section = CONFIG_LAYOUT.ADMIN_NOTIFICATIONS;
+    email = String(sheet.getRange(CONFIG_DATA_START_ROW, section.startCol).getValue() || '').trim();
+  }
+  __adminNotificationEmailCache = email;
+  return email;
+}
+
+/**
+ * Sends one admin email, if an address is configured. Never throws — a
+ * failed notification must not take down the sync that triggered it.
+ */
+function notifyAdmin(subject, body) {
+  const email = getAdminNotificationEmail();
+  if (!email) return false;
+  try {
+    MailApp.sendEmail(email, subject, body);
+    log(`Sent admin notification to ${email}: ${subject}`);
+    return true;
+  } catch (err) {
+    log(`⚠️ Could not send admin notification to "${email}" (${err}).`);
+    return false;
+  }
+}
+
+/**
+ * Per-run collector for things an admin should hear about. Sections are
+ * only included in the digest if something was actually added to them, and
+ * NO email is sent at all when the whole thing is empty — a quiet sync
+ * stays quiet, which is the only way a notification like this stays worth
+ * reading.
+ */
+let __adminDigest = null;
+
+function noteForAdmin(category, message) {
+  if (!__adminDigest) __adminDigest = {};
+  if (!__adminDigest[category]) __adminDigest[category] = [];
+  __adminDigest[category].push(message);
+}
+
+/** Sends the accumulated digest (if any) and resets the collector. */
+function flushAdminDigest(context) {
+  const digest = __adminDigest;
+  __adminDigest = null;
+  if (!digest) return false;
+
+  const categories = Object.keys(digest).filter(c => digest[c].length > 0);
+  if (categories.length === 0) return false;
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const lines = [];
+  categories.forEach(category => {
+    lines.push(`${category} (${digest[category].length}):`);
+    digest[category].forEach(m => lines.push(`  • ${m}`));
+    lines.push('');
+  });
+  if (ss) lines.push(`Workbook: ${ss.getUrl()}`);
+
+  const total = categories.reduce((sum, c) => sum + digest[c].length, 0);
+  return notifyAdmin(`[Calendar & Form Manager] ${context}: ${total} item(s) need attention`, lines.join('\n'));
+}
+
 function computeOrderAheadFlag(eventDate, submittedAt, orderAheadDays) {
   if (!eventDate || !submittedAt || !orderAheadDays) return '';
   const msPerDay = 24 * 60 * 60 * 1000;
@@ -1790,16 +1977,19 @@ function computeOrderAheadFlag(eventDate, submittedAt, orderAheadDays) {
 // 3. MENU & TRIGGER HOOKS
 // ============================================================================
 
+/**
+ * Deliberately just the three things anyone needs day to day. The setup
+ * entry points — initSheet() (rebuild every tab + formatting) and
+ * initializeAndSyncAll() — are still here and still work; they're just run
+ * from the Apps Script editor now rather than sitting in a menu where a
+ * mis-click reformats the whole workbook.
+ */
 function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu('🗓️ Calendar & Form Manager')
-    .addItem('▶️ Initialize & Sync Everything', 'initializeAndSyncAll')
-    .addSeparator()
     .addItem('Sync Cal', 'syncCalendars')
     .addItem('Sync Registrations', 'syncRegistrations')
-    .addSeparator()
-    .addItem('Re-run Sheet Setup / Formatting', 'initSheet')
-    .addItem('Rebuild Triggers', 'writeTriggers')
+    .addItem('Check Triggers', 'writeTriggers')
     .addToUi();
 }
 
@@ -2120,6 +2310,11 @@ function getRawEventStart(ev) {
  * potentially relevant, since a tracked session may have just been
  * deleted. An active event counts if it's a timed event, inside our
  * tracked lookahead window, and matches our title pattern.
+ *
+ * A still-tentative event ("*" title) is NOT relevant — the full sync
+ * would skip it anyway. Note this still catches CONFIRMATION correctly:
+ * dropping the asterisk makes the delta's new title non-tentative, which
+ * reads as relevant here and triggers the sync that builds its form.
  */
 function applyCalendarDeltaToSheets(calendarId, changedEvents) {
   const { start, end } = computeSyncDateRange();
@@ -2130,7 +2325,8 @@ function applyCalendarDeltaToSheets(calendarId, changedEvents) {
     const evStart = getRawEventStart(ev);
     if (!evStart || evStart < start || evStart > end) return false;
     if (ev.status === 'cancelled') return true;
-    return !!parseEventTitle(ev.summary);
+    const parsed = parseEventTitle(ev.summary);
+    return !!parsed && !parsed.isTentative;
   });
 
   if (!relevant) {
@@ -2159,14 +2355,44 @@ function computeSyncDateRange() {
 }
 
 /**
+ * Marker that flags an event as a Fixed series. Lives in the event
+ * DESCRIPTION now, not the title — a title is what attendees read on a
+ * shared calendar, and "[Fixed]" there is internal scheduling jargon.
+ * Matched case-insensitively anywhere in the description, so it coexists
+ * fine with the "Registration Link: ..." line we inject.
+ */
+const FIXED_SERIES_DESCRIPTION_MARKER = /\[\s*Fixed\s*\]/i;
+
+/** A leading "*" on the title marks an event TENTATIVE — see parseEventTitle(). */
+const TENTATIVE_TITLE_PREFIX = '*';
+
+/**
  * Parses event titles. Recognized shapes:
- *   "Yoga Basics [Cap: 12, Fixed]"  -> capped, fixed series
- *   "Book Club [Cap: 20]"           -> capped, regular (monthly) series
- *   "Book Club [Fixed]"             -> UNCAPPED fixed series
- *   "Chess Night"                   -> UNCAPPED regular series (no brackets)
+ *   "Yoga Basics [Cap: 12]"   -> capped
+ *   "Chess Night"             -> UNCAPPED (no brackets)
+ *   "*Yoga Basics [Cap: 12]"  -> capped, but TENTATIVE (see below)
+ *
+ * Fixed-vs-Regular is NO LONGER read from the title — it comes from the
+ * event description via isFixedFromDescription(). A legacy "[... Fixed]"
+ * in the title is still honored (and logged) so existing calendars keep
+ * working, but the description is the supported home for it.
+ *
+ * A title beginning with "*" marks the event TENTATIVE: it is skipped
+ * entirely by the form/registry pipeline until the asterisk is removed
+ * (see syncCalendarsInternal()). The asterisk is stripped from cleanTitle,
+ * which matters a lot — computeEventId() keys off cleanTitle, so an event's
+ * ID is IDENTICAL before and after it is confirmed. Un-asterisking is
+ * therefore just "a new event appears," with no ID churn.
  */
 function parseEventTitle(title) {
-  const raw = String(title || '').trim();
+  let raw = String(title || '').trim();
+  if (!raw) return null;
+
+  let isTentative = false;
+  while (raw.charAt(0) === TENTATIVE_TITLE_PREFIX) {
+    isTentative = true;
+    raw = raw.substring(1).trim();
+  }
   if (!raw) return null;
 
   const match = /^(.*?)\s*(?:\[\s*(.*?)\s*\])?\s*$/.exec(raw);
@@ -2176,9 +2402,28 @@ function parseEventTitle(title) {
   const bracketContent = match[2] || '';
   const capMatch = /Cap:\s*(\d+)/i.exec(bracketContent);
   const capacity = capMatch ? parseInt(capMatch[1], 10) : 0;
-  const isFixed = /\bFixed\b/i.test(bracketContent);
+  const legacyFixedInTitle = /\bFixed\b/i.test(bracketContent);
 
-  return { cleanTitle, capacity, isFixed };
+  return { cleanTitle, capacity, isTentative, legacyFixedInTitle };
+}
+
+/**
+ * Decides whether a calendar event is a Fixed series, reading the
+ * description marker first and falling back to the deprecated title
+ * bracket. Takes the already-parsed title so the legacy check is free.
+ */
+function isFixedSeries(event, parsedTitle) {
+  const description = (event && typeof event.getDescription === 'function')
+    ? (event.getDescription() || '')
+    : '';
+  if (FIXED_SERIES_DESCRIPTION_MARKER.test(description)) return true;
+
+  if (parsedTitle && parsedTitle.legacyFixedInTitle) {
+    log(`ℹ️ "${parsedTitle.cleanTitle}" still marks itself Fixed in its TITLE. That still works, but the supported ` +
+      `place is the event description — add "[Fixed]" there and drop it from the title.`);
+    return true;
+  }
+  return false;
 }
 
 /** Public entry point: acquires a script lock so overlapping executions can't race each other. */
@@ -2218,13 +2463,30 @@ function syncCalendarsInternal() {
         return;
       }
 
+      const tentativeTitles = new Set();
       const parsedEvents = events
         .filter(ev => !ev.isAllDayEvent())
         .map(ev => {
           const parsed = parseEventTitle(ev.getTitle());
-          return parsed ? { ev, parsed } : null;
+          if (!parsed) return null;
+          // Tentative events are skipped WHOLESALE — no form, no registry
+          // row — until the leading "*" comes off. Because parseEventTitle()
+          // strips the asterisk from cleanTitle, confirming an event later
+          // produces the exact same Event_ID, so it simply flows through as
+          // a brand-new session with no reconciliation needed.
+          if (parsed.isTentative) {
+            tentativeTitles.add(parsed.cleanTitle);
+            return null;
+          }
+          parsed.isFixed = isFixedSeries(ev, parsed);
+          return { ev, parsed };
         })
         .filter(Boolean);
+
+      if (tentativeTitles.size > 0) {
+        log(`Skipped ${tentativeTitles.size} tentative program(s) at ${locationName} (title starts with "*"): ` +
+          `${Array.from(tentativeTitles).join(', ')}. Remove the asterisk to generate forms.`);
+      }
 
       const groups = buildEventGroups(parsedEvents, calendarId);
       const configInfo = { footerNote: getFormFooterForLocation(locationName) };
@@ -2277,6 +2539,7 @@ function syncCalendarsInternal() {
     SpreadsheetApp.getActiveSpreadsheet().toast('Calendar sync complete ✅', 'Calendar & Form Manager', 5);
   } finally {
     flushPersistentRegistries(); // never strand a form-label fingerprint written during this run
+    flushAdminDigest('Calendar sync');
     writeCalendarChangeTriggers();
   }
 }
@@ -2393,7 +2656,9 @@ function refreshFormForNewDates(formId, group, locationName, configInfo) {
 
   return {
     formId: form.getId(),
-    publishedUrl: form.getPublishedUrl(),
+    // Rebuilt here rather than reused: the grid rows just changed, and a
+    // prefill URL encodes the exact rows it was generated against.
+    publishedUrl: buildRegistrationUrl(form),
     editUrl: form.getEditUrl(),
     dateLabels: allDateLabels
   };
@@ -2441,7 +2706,7 @@ function createRegistrationForm(group, locationName, configInfo) {
 
   return {
     formId: form.getId(),
-    publishedUrl: form.getPublishedUrl(),
+    publishedUrl: buildRegistrationUrl(form), // prefilled all-checked when possible
     editUrl: form.getEditUrl(),
     dateLabels: allDateLabels
   };
@@ -2522,6 +2787,11 @@ function moveRegistrantsToTriage(registrantsSheet, deletedEventInfo) {
   renderTriageSheet(false, existingTriageRows.concat(newTriageRows));
 
   log(`Moved ${newTriageRows.length} registrant row(s) to "${SHEET_NAMES.TRIAGE}".`);
+  Object.keys(deletedEventInfo).forEach(eventId => {
+    const info = deletedEventInfo[eventId];
+    noteForAdmin('Deleted events sent to triage',
+      `${info.cleanTitle} (${info.location}) — its calendar event is gone; registrants need confirming.`);
+  });
 }
 
 function backInjectCalendarDescriptions(group, formInfo) {
@@ -2585,6 +2855,9 @@ function syncRegistrations() {
       form = FormApp.openById(formId);
     } catch (err) {
       log(`⚠️ Could not open form ${formId}: ${err}`);
+      // Worth an admin's attention: a form we can't open is one whose
+      // registrations are silently not being imported.
+      noteForAdmin('Forms that could not be opened', `${formId} — ${err}`);
       return;
     }
 
@@ -2618,6 +2891,7 @@ function syncRegistrations() {
 
   flushPersistentRegistries();
   setLastSyncTime(syncStartedAt);
+  flushAdminDigest('Registration sync'); // no-op unless something above actually needed attention
   SpreadsheetApp.getActiveSpreadsheet().toast(`Registration sync complete ✅ (${newRows.length} new rows)`, 'Calendar & Form Manager', 5);
 }
 
@@ -2982,6 +3256,13 @@ function buildRegistrantRow(args) {
   const lunchStatus = programStatus === 'Waitlisted'
     ? 'Waitlisted'
     : (lunchType && lunchType !== 'No Lunch' ? 'Needed' : 'No Lunch');
+
+  if (programStatus === 'Waitlisted') {
+    // Someone just hit a cap. That's the one registration outcome a human
+    // usually has to do something about, so it goes in the admin digest.
+    noteForAdmin('Waitlisted registrants',
+      `${displayName} (${personType}) for ${formatDateLabel(registryEntry.eventDate)} — capacity ${registryEntry.maxCapacity} is full.`);
+  }
 
   registryEntry.activeCountSoFar = (registryEntry.activeCountSoFar || 0) + (programStatus === 'Active' ? 1 : 0);
 
@@ -3749,6 +4030,15 @@ function getDashboardRowPlan() {
  * day's Meal_Shorthand/Type pulled from Lunch_Schedule (per date AND
  * location now). Only rows with Program_Status=Active AND Lunch_Status=Needed
  * count toward catering.
+ *
+ * Every UPCOMING session date+location is seeded at count 0 whether or not
+ * anyone has registered yet, so the catering schedule shows what is coming
+ * instead of materializing a date only once its first registrant appears —
+ * staff need the empty rows to plan against (and to hand-enter buffers on).
+ * Dates explicitly marked "Not Serving" for their location are left out;
+ * a date with no Lunch_Schedule row at all IS seeded, since an unconfigured
+ * date is exactly the thing worth surfacing. Past dates are never seeded —
+ * that would backfill a wall of empty history.
  */
 function buildDashboardRollup(registrantRows) {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -3770,6 +4060,19 @@ function buildDashboardRollup(registrantRows) {
   });
 
   const rollup = {};
+
+  // Seed every upcoming date+location at 0 so the schedule shows what's
+  // coming rather than only what's already been registered for.
+  const todayKey = formatDateKey(new Date());
+  Object.keys(eventMeta).forEach(eventId => {
+    const meta = eventMeta[eventId];
+    if (!meta.location || meta.dateKey < todayKey) return;
+    const meal = getMealInfoForDate(parseDateKey(meta.dateKey), meta.location);
+    if (meal && meal.type === 'Not Serving') return; // nothing is catered that day, by design
+    const key = `${meta.dateKey}|${meta.location}`;
+    if (!rollup[key]) rollup[key] = { dateKey: meta.dateKey, location: meta.location, registeredCount: 0 };
+  });
+
   if (registrantsSheet || registrantRows) {
     const lrHeaders = HEADERS.Lunch_and_Event_Registrants;
     const lrRows = registrantRows || readAllSectionedRows(registrantsSheet, lrHeaders, 'Event_ID');
