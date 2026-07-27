@@ -118,6 +118,38 @@
  *      of sync with the parser.
  *    - Form descriptions list dates one-per-line.
  *
+ *  PERFORMANCE / CACHING CONTRACT (see section 1c):
+ *    Everything expensive in a sync is a REMOTE call — a Sheets read, a
+ *    FormApp call, a CalendarApp fetch, a Script Properties round trip — so
+ *    the optimization work is all about not making the same one twice.
+ *      - Per-EXECUTION caches (Apps Script globals, which die with the run,
+ *        so there is no cross-run staleness to reason about): the
+ *        Lunch_Schedule meal index, Config's meal buffers + order-ahead
+ *        days, per-form item lookups, and the calendar event fetch. Each is
+ *        dropped by whatever rewrites its source — invalidateMealInfoIndex()
+ *        from renderLunchScheduleSheet(), invalidateConfigCaches() from
+ *        buildConfigSheet(), invalidateFormItemIndex() from
+ *        applyFormDateLabels(), invalidateCalendarEventsCache() from the
+ *        calendar-delta handler. ADD A NEW CACHE ONLY WITH ITS INVALIDATOR.
+ *      - Batched Script Properties: the form registry, the all-dates
+ *        registry, and the form-label fingerprints are read once and written
+ *        at most once per run via flushPersistentRegistries(), called as
+ *        soon as each dirtying loop finishes rather than at the very end.
+ *      - Fingerprinted form writes: applyFormDateLabels() hashes the labels
+ *        it is about to write and skips the entire FormApp round trip when
+ *        they match what this script last wrote to that form. Since the
+ *        hourly capacity-label refresh normally has nothing to change, the
+ *        common case costs zero Forms calls. The fingerprint only tracks
+ *        THIS script's writes — a hand-edited form is not detected until
+ *        the labels legitimately change again (pass { force: true }).
+ *      - Rows already in memory are threaded, not re-read: syncRegistrations()
+ *        reads each tab once and hands the rows to the count recompute, the
+ *        dashboard render, and the lunch rollup. renderProgramDashboard()
+ *        reports registrantsMoved back so a caller knows when its copy went
+ *        stale under a triage sweep.
+ *    Bulk sheet WRITES were already batched (one setValues/setBackgrounds/
+ *    setFormulas per block, never a per-cell loop) — keep it that way.
+ *
  *  SETUP:
  *    1. Update CALENDAR_MAP below with your real Calendar IDs -> locations.
  *    2. In the Apps Script editor: Services (+) -> add "Google Calendar API"
@@ -145,9 +177,9 @@ function log(msg) {
 
 /** Calendar ID -> human-readable location name. */
 const CALENDAR_MAP = {
-  'c_abdd3adf5003b03fe953636a61771c2c5261f71f9520197e6dfc5d262cccc117@group.calendar.google.com': 'Narberth',
-  'c_33a79383882a214a9cab3cbbb0ce63fa459f5459d91e6e378c68e23aa75ed1b8@group.calendar.google.com': 'Ashbridge',
-  'c_c4d3d99412906aea447f6d2e6ed805c16ff9a3661a18fa3b2a4a891023ad4a64@group.calendar.google.com': 'Zoom'
+  'c_a1a2cd2f999f1bed82d1f21c59a1cb381485a28297a3ff1b8d394e2ad5fdc282@group.calendar.google.com': 'Narberth',
+  'c_e75805d7180c15888ed58e5625878088059c001053181bbaffceac8f6a64e1dd@group.calendar.google.com': 'Ashbridge',
+  'c_562b3332ef81d94b74100a3075f00d0f68061a01edcf46ea1378872c60d91c07@group.calendar.google.com': 'Zoom'
 };
 
 /**
@@ -622,16 +654,33 @@ function buildFormDescription(locationName, dateLabels, isFixed) {
  */
 const FORM_REGISTRY_PROP_KEY = 'FORM_REGISTRY_MAP_V1';
 
+/**
+ * Both persistent registries below are read once per execution and written
+ * back at most once, via flushPersistentRegistries(). They used to
+ * get+JSON.parse+stringify+set on EVERY entry — once per group in
+ * syncCalendars(), and once per PERSON PER RESPONSE in
+ * processAllDatesResponse(), which is the worst offender since a party of
+ * four cost four full round trips to the property store. The flush is
+ * called as soon as the loop that dirties them finishes (not at the very
+ * end of the run) so the crash window stays about as small as it was.
+ */
+let __formRegistryCache = null;
+let __formRegistryDirty = false;
+let __allDatesRegistryCache = null;
+let __allDatesRegistryDirty = false;
+
 function getPersistentFormRegistry() {
+  if (__formRegistryCache) return __formRegistryCache;
   const raw = PropertiesService.getScriptProperties().getProperty(FORM_REGISTRY_PROP_KEY);
-  return raw ? JSON.parse(raw) : {};
+  __formRegistryCache = raw ? JSON.parse(raw) : {};
+  return __formRegistryCache;
 }
 
 function savePersistentFormRegistryEntry(groupKey, formId) {
   const registry = getPersistentFormRegistry();
   if (registry[groupKey] === formId) return;
   registry[groupKey] = formId;
-  PropertiesService.getScriptProperties().setProperty(FORM_REGISTRY_PROP_KEY, JSON.stringify(registry));
+  __formRegistryDirty = true;
 }
 
 /**
@@ -645,8 +694,10 @@ function savePersistentFormRegistryEntry(groupKey, formId) {
 const ALL_DATES_REGISTRY_PROP_KEY = 'ALL_DATES_REGISTRANTS_V1';
 
 function getAllDatesRegistry() {
+  if (__allDatesRegistryCache) return __allDatesRegistryCache;
   const raw = PropertiesService.getScriptProperties().getProperty(ALL_DATES_REGISTRY_PROP_KEY);
-  return raw ? JSON.parse(raw) : {};
+  __allDatesRegistryCache = raw ? JSON.parse(raw) : {};
+  return __allDatesRegistryCache;
 }
 
 function saveAllDatesRegistryEntry(formId, entry) {
@@ -655,7 +706,24 @@ function saveAllDatesRegistryEntry(formId, entry) {
   const key = `${normalizeNameKey(entry.name)}|${entry.personType}`;
   registry[formId] = registry[formId].filter(e => `${normalizeNameKey(e.name)}|${e.personType}` !== key);
   registry[formId].push(entry);
-  PropertiesService.getScriptProperties().setProperty(ALL_DATES_REGISTRY_PROP_KEY, JSON.stringify(registry));
+  __allDatesRegistryDirty = true;
+}
+
+/** Writes back whichever persistent registries were actually modified. Safe to call repeatedly — a clean registry costs nothing. */
+function flushPersistentRegistries() {
+  const props = PropertiesService.getScriptProperties();
+  if (__formRegistryDirty && __formRegistryCache) {
+    props.setProperty(FORM_REGISTRY_PROP_KEY, JSON.stringify(__formRegistryCache));
+    __formRegistryDirty = false;
+  }
+  if (__allDatesRegistryDirty && __allDatesRegistryCache) {
+    props.setProperty(ALL_DATES_REGISTRY_PROP_KEY, JSON.stringify(__allDatesRegistryCache));
+    __allDatesRegistryDirty = false;
+  }
+  if (__formLabelFingerprintDirty && __formLabelFingerprintCache) {
+    props.setProperty(FORM_LABEL_FINGERPRINT_PROP_KEY, JSON.stringify(__formLabelFingerprintCache));
+    __formLabelFingerprintDirty = false;
+  }
 }
 
 const SYNC_LOCK_WAIT_MS = 10 * 1000;
@@ -1009,6 +1077,140 @@ function buildTextEqualsRuleForRanges(ranges, text, bgColor) {
 
 
 // ============================================================================
+// 1c. PER-EXECUTION CACHES  (the sync hot paths)
+// ============================================================================
+//
+// An Apps Script global lives exactly as long as ONE execution, which makes
+// globals the natural home for "read this tab once per run" memoization:
+// there is no cross-run staleness to reason about, only within-run
+// invalidation whenever this script itself rewrites the tab a cache was
+// built from. Every cache below is explicitly dropped by the code path that
+// dirties it — grep the invalidate* functions for their call sites.
+//
+// What these replace (all of it per-call before):
+//   - getMealInfoForDate() re-read the ENTIRE Lunch_Schedule tab on every
+//     single call, and buildDateLabelSets() calls it 2-3x PER DATE. A
+//     10-date form therefore cost ~30 full-tab reads to build its labels,
+//     once per form, on every sync.
+//   - getMealBufferConfigForLocation()/getOrderAheadDays() re-read Config
+//     per call, the former once per lunch-dashboard rollup row.
+//   - form.getItems() is a REMOTE call and getResponseValueByTitle() made
+//     one per lookup — roughly ten per response, times every response.
+//   - CalendarApp.getEvents() ran once per calendar in syncCalendarsInternal()
+//     AND again in every triageDeletedSessions() pass; a full
+//     initializeAndSyncAll() hit the calendars four times over.
+// ============================================================================
+
+let __mealInfoIndexCache = null;
+let __mealBufferIndexCache = null;
+let __orderAheadDaysCache = null;
+let __calendarEventsCache = null;
+let __formItemIndexCache = {};
+
+/**
+ * Reads Lunch_Schedule ONCE per execution into
+ * { 'yyyy-MM-dd|Location': mealInfo, 'yyyy-MM-dd': mealInfo }. The
+ * date-only key preserves getMealInfoForDate()'s original "no location
+ * given -> first matching row wins" behavior; first write wins for both key
+ * shapes, matching the old top-to-bottom scan.
+ */
+function getMealInfoIndex() {
+  if (__mealInfoIndexCache) return __mealInfoIndexCache;
+  const index = {};
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss ? ss.getSheetByName(SHEET_NAMES.LUNCH_SCHEDULE) : null;
+  if (sheet) {
+    const headers = HEADERS.Lunch_Schedule;
+    const map = getIndexMap(headers);
+    readAllSectionedRows(sheet, headers, 'Event_Date').forEach(row => {
+      const rowDate = coerceDate(row[map['Event_Date']]);
+      if (!rowDate) return;
+      const dateKey = formatDateKey(rowDate);
+      const location = String(row[map['Location']] || '').trim();
+      const info = {
+        type: row[map['Type']] || '',
+        description: row[map['Meal_Description']] || '',
+        shorthand: row[map['Meal_Shorthand']] || ''
+      };
+      const locatedKey = `${dateKey}|${location}`;
+      if (index[locatedKey] === undefined) index[locatedKey] = info;
+      if (index[dateKey] === undefined) index[dateKey] = info;
+    });
+  }
+  __mealInfoIndexCache = index;
+  return index;
+}
+
+/** Called by renderLunchScheduleSheet() — the only thing that rewrites the tab this index is built from. */
+function invalidateMealInfoIndex() {
+  __mealInfoIndexCache = null;
+}
+
+/** Called by buildConfigSheet() — the only thing that rewrites/seeds the Config tab. */
+function invalidateConfigCaches() {
+  __mealBufferIndexCache = null;
+  __orderAheadDaysCache = null;
+}
+
+/**
+ * Item lookups for one form, built with a SINGLE form.getItems() round
+ * trip: { byTitle: {title: [item...]}, paragraphItems: [...] }. Cached per
+ * form ID for the rest of the execution. Only ever used for READS — the
+ * refresh paths that mutate a form's items call invalidateFormItemIndex().
+ */
+function getFormItemIndex(form) {
+  const formId = form.getId();
+  if (__formItemIndexCache[formId]) return __formItemIndexCache[formId];
+  const items = form.getItems();
+  const byTitle = {};
+  const paragraphItems = [];
+  items.forEach(item => {
+    const title = item.getTitle();
+    if (!byTitle[title]) byTitle[title] = [];
+    byTitle[title].push(item);
+    if (item.getType() === FormApp.ItemType.PARAGRAPH_TEXT) paragraphItems.push(item);
+  });
+  const index = { form, formId, items, byTitle, paragraphItems };
+  __formItemIndexCache[formId] = index;
+  return index;
+}
+
+function invalidateFormItemIndex(formId) {
+  if (formId) delete __formItemIndexCache[formId];
+  else __formItemIndexCache = {};
+}
+
+/**
+ * One CalendarApp.getEvents() per calendar per execution, keyed on the sync
+ * window so a differently-scoped call still re-fetches. Returns
+ * { calendarId: [CalendarEvent...] | null }, where null means the calendar
+ * was inaccessible (callers log and skip, same as before).
+ *
+ * Safe to share across a full syncCalendars(): that run edits event
+ * DESCRIPTIONS (backInjectCalendarDescriptions) but never adds or removes
+ * events, so the set of live events this cache represents stays accurate.
+ */
+function getCalendarEventsForWindow(start, end) {
+  const windowKey = `${start.getTime()}|${end.getTime()}`;
+  if (__calendarEventsCache && __calendarEventsCache.windowKey === windowKey) {
+    return __calendarEventsCache.byCalendar;
+  }
+  const byCalendar = {};
+  Object.keys(CALENDAR_MAP).forEach(calendarId => {
+    const calendar = CalendarApp.getCalendarById(calendarId);
+    byCalendar[calendarId] = calendar ? calendar.getEvents(start, end) : null;
+  });
+  __calendarEventsCache = { windowKey, byCalendar };
+  return byCalendar;
+}
+
+/** Drops the calendar cache — used after anything that could change which events exist. */
+function invalidateCalendarEventsCache() {
+  __calendarEventsCache = null;
+}
+
+
+// ============================================================================
 // 1b. LUNCH SCHEDULE LOOKUP (per Event_Date x Location — see Lunch_Schedule tab)
 // ============================================================================
 
@@ -1021,29 +1223,15 @@ function getFormFooterForLocation(locationName) {
  * Looks up the day's meal info (Type, Meal_Description, Meal_Shorthand)
  * from Lunch_Schedule for one specific date AND location. Returns null if
  * no row exists for that date+location yet. Type may be 'Hot' | 'Cold' |
- * 'Not Serving'.
+ * 'Not Serving'. Backed by getMealInfoIndex()'s one-read-per-execution map
+ * (this used to re-read the whole tab on every call).
  */
 function getMealInfoForDate(date, location) {
   if (!date) return null;
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const sheet = ss.getSheetByName(SHEET_NAMES.LUNCH_SCHEDULE);
-  if (!sheet) return null;
-  const headers = HEADERS.Lunch_Schedule;
-  const rows = readAllSectionedRows(sheet, headers, 'Event_Date');
-  if (rows.length === 0) return null;
-  const map = getIndexMap(headers);
+  const index = getMealInfoIndex();
   const dateKey = formatDateKey(date);
-  for (const row of rows) {
-    const rowDate = coerceDate(row[map['Event_Date']]);
-    if (!rowDate || formatDateKey(rowDate) !== dateKey) continue;
-    if (location && String(row[map['Location']] || '').trim() !== String(location).trim()) continue;
-    return {
-      type: row[map['Type']] || '',
-      description: row[map['Meal_Description']] || '',
-      shorthand: row[map['Meal_Shorthand']] || ''
-    };
-  }
-  return null;
+  const key = location ? `${dateKey}|${String(location).trim()}` : dateKey;
+  return index[key] || null;
 }
 
 /**
@@ -1119,6 +1307,78 @@ function buildCapacityHintsFromRegistryRows(rows, map) {
  */
 const GENERIC_LUNCH_CHOICES = ['No Lunch', 'Yes - Lunch'];
 
+
+// ============================================================================
+// 1d. FORM DATE-LABEL WRITES  (fingerprinted — see applyFormDateLabels)
+// ============================================================================
+//
+// Every path that pushes date labels onto a form funnels through
+// applyFormDateLabels(). Writing a form item is a remote call AND creates a
+// new form revision, and the labels are usually byte-identical to what's
+// already there — refreshFormCapacityLabelsForAllForms() in particular runs
+// on EVERY hourly sync across every capped form. So we keep a hash of the
+// last labels written per form in Script Properties and short-circuit
+// before FormApp.openById() (itself the most expensive call in the path)
+// whenever nothing changed.
+//
+// The fingerprint tracks only what THIS script writes. A human editing a
+// form's grid rows by hand would not be noticed until the labels legitimately
+// change again — pass { force: true } (or clear the property) to re-assert.
+// ============================================================================
+
+const FORM_LABEL_FINGERPRINT_PROP_KEY = 'FORM_LABEL_FINGERPRINTS_V1';
+
+let __formLabelFingerprintCache = null;
+let __formLabelFingerprintDirty = false;
+
+function getFormLabelFingerprints() {
+  if (__formLabelFingerprintCache) return __formLabelFingerprintCache;
+  const raw = PropertiesService.getScriptProperties().getProperty(FORM_LABEL_FINGERPRINT_PROP_KEY);
+  __formLabelFingerprintCache = raw ? JSON.parse(raw) : {};
+  return __formLabelFingerprintCache;
+}
+
+function computeFormLabelFingerprint(attendanceLabels, lunchLabels) {
+  const raw = JSON.stringify([attendanceLabels, lunchLabels]);
+  const digest = Utilities.computeDigest(Utilities.DigestAlgorithm.MD5, raw);
+  return digest.map(b => ((b < 0 ? b + 256 : b).toString(16)).padStart(2, '0')).join('');
+}
+
+/**
+ * Sets a form's ATTENDANCE_GRID rows to attendanceLabels and its LUNCH_GRID
+ * rows to lunchLabels (across every guest-count branch), skipping the whole
+ * thing when the labels match what we last wrote to that form.
+ *
+ * options.form    — an already-open Form, to avoid a second openById()
+ * options.force   — write even if the fingerprint matches
+ * options.context — short string for the log line on failure
+ * Returns true if the form was actually written to.
+ */
+function applyFormDateLabels(formId, attendanceLabels, lunchLabels, options) {
+  options = options || {};
+  const fingerprint = computeFormLabelFingerprint(attendanceLabels, lunchLabels);
+  const fingerprints = getFormLabelFingerprints();
+  if (!options.force && fingerprints[formId] === fingerprint) return false;
+
+  try {
+    const form = options.form || FormApp.openById(formId);
+    const items = form.getItems();
+    items.filter(it => it.getTitle() === TEMPLATE_ITEM_TITLES.ATTENDANCE_GRID)
+      .forEach(it => it.asCheckboxGridItem().setRows(attendanceLabels));
+    items.filter(it => it.getTitle() === TEMPLATE_ITEM_TITLES.LUNCH_GRID)
+      .forEach(it => it.asCheckboxGridItem().setRows(lunchLabels));
+  } catch (err) {
+    log(`⚠️ Could not write date labels to form ${formId}${options.context ? ` (${options.context})` : ''}: ${err}`);
+    return false;
+  }
+
+  fingerprints[formId] = fingerprint;
+  __formLabelFingerprintDirty = true;
+  invalidateFormItemIndex(formId); // cached grid row/column shapes for this form are now stale
+  return true;
+}
+
+
 /**
  * Fired via onEdit() when Lunch_Schedule is hand-edited. Reorganizes the
  * tab into fresh Upcoming/Past sections reflecting whatever was just
@@ -1181,17 +1441,11 @@ function refreshFormsForChangedLunchDate(changedDate, location) {
     const capacityHints = buildCapacityHintsFromRegistryRows(formRows, map);
     const { allDateLabels, lunchDateLabels } = buildDateLabelSets(datesForForm, formLocation, capacityHints);
     const lunchLabels = lunchDateLabels.length > 0 ? lunchDateLabels : ['No lunch served for any date on this form'];
-    try {
-      const form = FormApp.openById(formId);
-      form.getItems().filter(it => it.getTitle() === TEMPLATE_ITEM_TITLES.ATTENDANCE_GRID)
-        .forEach(it => it.asCheckboxGridItem().setRows(allDateLabels));
-      form.getItems().filter(it => it.getTitle() === TEMPLATE_ITEM_TITLES.LUNCH_GRID)
-        .forEach(it => it.asCheckboxGridItem().setRows(lunchLabels));
+    if (applyFormDateLabels(formId, allDateLabels, lunchLabels, { context: 'Lunch_Schedule edit' })) {
       log(`Refreshed form ${formId}'s date labels after a Lunch_Schedule edit affecting ${changedKey} (${formLocation}).`);
-    } catch (err) {
-      log(`⚠️ Could not refresh form ${formId} after a Lunch_Schedule edit (${err}).`);
     }
   });
+  flushPersistentRegistries();
 }
 
 
@@ -1426,6 +1680,7 @@ function styleConfigSheet(sheet) {
 
   seedMealBufferRows(sheet);
   seedOrderAheadRow(sheet);
+  invalidateConfigCaches(); // both seeds may have just written rows the caches were built from
 }
 
 /** Pre-fills the fixed Location x Hot/Cold combinations if they aren't already present. Never overwrites an existing combo's row. */
@@ -1469,37 +1724,56 @@ function seedOrderAheadRow(sheet) {
  * (which is always the case for "Not Serving," by design).
  */
 function getMealBufferConfigForLocation(locationName, lunchType) {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const sheet = ss.getSheetByName(SHEET_NAMES.CONFIG);
-  if (!sheet) return Object.assign({}, DEFAULT_MEAL_BUFFERS);
-
-  const lastRow = sheet.getLastRow();
-  if (lastRow < CONFIG_DATA_START_ROW) return Object.assign({}, DEFAULT_MEAL_BUFFERS);
-
-  const numRows = lastRow - CONFIG_DATA_START_ROW + 1;
-  const section = CONFIG_LAYOUT.MEAL_BUFFERS;
-  const data = sheet.getRange(CONFIG_DATA_START_ROW, section.startCol, numRows, section.headers.length).getValues();
-
-  for (const [loc, type, standardAmt, testerAmt] of data) {
-    if (String(loc).trim() !== locationName || String(type).trim() !== String(lunchType).trim()) continue;
-    return {
-      standardBufferAmount: (standardAmt !== '' && !isNaN(standardAmt)) ? Number(standardAmt) : DEFAULT_MEAL_BUFFERS.standardBufferAmount,
-      testerBufferAmount: (testerAmt !== '' && !isNaN(testerAmt)) ? Number(testerAmt) : DEFAULT_MEAL_BUFFERS.testerBufferAmount
-    };
-  }
+  const index = getMealBufferIndex();
+  const hit = index[`${locationName}|${String(lunchType).trim()}`];
+  if (hit) return Object.assign({}, hit);
 
   log(`No Meal Buffer Amounts row found for "${locationName}" / "${lunchType}" yet — using defaults (Standard: ${DEFAULT_MEAL_BUFFERS.standardBufferAmount}, Tester: ${DEFAULT_MEAL_BUFFERS.testerBufferAmount}).`);
   return Object.assign({}, DEFAULT_MEAL_BUFFERS);
 }
 
-function getOrderAheadDays() {
+/**
+ * Reads Config's "Meal Buffer Amounts" section ONCE per execution into
+ * { 'Location|Type': {standardBufferAmount, testerBufferAmount} }. Was a
+ * full Config read per call, and updateMasterLunchDashboard() calls it once
+ * per rollup row.
+ */
+function getMealBufferIndex() {
+  if (__mealBufferIndexCache) return __mealBufferIndexCache;
+  const index = {};
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const sheet = ss.getSheetByName(SHEET_NAMES.CONFIG);
-  if (!sheet) return DEFAULT_ORDER_AHEAD_DAYS;
-  const section = CONFIG_LAYOUT.ORDER_AHEAD;
-  const val = sheet.getRange(CONFIG_DATA_START_ROW, section.startCol).getValue();
-  const num = Number(val);
-  return (val !== '' && !isNaN(num) && num > 0) ? num : DEFAULT_ORDER_AHEAD_DAYS;
+  const sheet = ss ? ss.getSheetByName(SHEET_NAMES.CONFIG) : null;
+  const lastRow = sheet ? sheet.getLastRow() : 0;
+  if (sheet && lastRow >= CONFIG_DATA_START_ROW) {
+    const section = CONFIG_LAYOUT.MEAL_BUFFERS;
+    const numRows = lastRow - CONFIG_DATA_START_ROW + 1;
+    const data = sheet.getRange(CONFIG_DATA_START_ROW, section.startCol, numRows, section.headers.length).getValues();
+    data.forEach(([loc, type, standardAmt, testerAmt]) => {
+      const key = `${String(loc).trim()}|${String(type).trim()}`;
+      if (index[key] !== undefined) return; // first matching row wins, as the old top-down scan did
+      index[key] = {
+        standardBufferAmount: (standardAmt !== '' && !isNaN(standardAmt)) ? Number(standardAmt) : DEFAULT_MEAL_BUFFERS.standardBufferAmount,
+        testerBufferAmount: (testerAmt !== '' && !isNaN(testerAmt)) ? Number(testerAmt) : DEFAULT_MEAL_BUFFERS.testerBufferAmount
+      };
+    });
+  }
+  __mealBufferIndexCache = index;
+  return index;
+}
+
+function getOrderAheadDays() {
+  if (__orderAheadDaysCache !== null) return __orderAheadDaysCache;
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss ? ss.getSheetByName(SHEET_NAMES.CONFIG) : null;
+  let days = DEFAULT_ORDER_AHEAD_DAYS;
+  if (sheet) {
+    const section = CONFIG_LAYOUT.ORDER_AHEAD;
+    const val = sheet.getRange(CONFIG_DATA_START_ROW, section.startCol).getValue();
+    const num = Number(val);
+    if (val !== '' && !isNaN(num) && num > 0) days = num;
+  }
+  __orderAheadDaysCache = days;
+  return days;
 }
 
 function computeOrderAheadFlag(eventDate, submittedAt, orderAheadDays) {
@@ -1865,6 +2139,7 @@ function applyCalendarDeltaToSheets(calendarId, changedEvents) {
   }
 
   log(`Calendar delta for "${locationName}" contained a relevant change — running a full syncCalendars() to reconcile.`);
+  invalidateCalendarEventsCache(); // the delta just told us the event set moved
   syncCalendars();
 }
 
@@ -1933,16 +2208,16 @@ function syncCalendarsInternal() {
     }
 
     const existingState = getExistingRegistryState(registrySheet);
+    const eventsByCalendar = getCalendarEventsForWindow(start, end);
 
     Object.keys(CALENDAR_MAP).forEach(calendarId => {
       const locationName = CALENDAR_MAP[calendarId];
-      const calendar = CalendarApp.getCalendarById(calendarId);
-      if (!calendar) {
+      const events = eventsByCalendar[calendarId];
+      if (!events) {
         log(`⚠️ Calendar not found or inaccessible: ${calendarId}`);
         return;
       }
 
-      const events = calendar.getEvents(start, end);
       const parsedEvents = events
         .filter(ev => !ev.isAllDayEvent())
         .map(ev => {
@@ -1995,10 +2270,13 @@ function syncCalendarsInternal() {
       });
     });
 
+    flushPersistentRegistries(); // one write covering every group touched above
+
     renderProgramDashboard();
 
     SpreadsheetApp.getActiveSpreadsheet().toast('Calendar sync complete ✅', 'Calendar & Form Manager', 5);
   } finally {
+    flushPersistentRegistries(); // never strand a form-label fingerprint written during this run
     writeCalendarChangeTriggers();
   }
 }
@@ -2111,10 +2389,7 @@ function refreshFormForNewDates(formId, group, locationName, configInfo) {
 
   // Only ROWS are refreshed here — grid COLUMNS (the person labels) are
   // fixed per guest-count branch at template-build time and never touched again.
-  form.getItems().filter(it => it.getTitle() === TEMPLATE_ITEM_TITLES.ATTENDANCE_GRID)
-    .forEach(it => it.asCheckboxGridItem().setRows(allDateLabels));
-  form.getItems().filter(it => it.getTitle() === TEMPLATE_ITEM_TITLES.LUNCH_GRID)
-    .forEach(it => it.asCheckboxGridItem().setRows(lunchLabels));
+  applyFormDateLabels(formId, allDateLabels, lunchLabels, { form, context: 'new dates on an existing form' });
 
   return {
     formId: form.getId(),
@@ -2157,11 +2432,10 @@ function createRegistrationForm(group, locationName, configInfo) {
   form.setDescription(buildFormDescription(locationName, allDateLabels, group.isFixed));
 
   // Only ROWS are set here — grid COLUMNS (the person labels) were already
-  // baked in per guest-count branch when the template was built.
-  form.getItems().filter(it => it.getTitle() === TEMPLATE_ITEM_TITLES.ATTENDANCE_GRID)
-    .forEach(it => it.asCheckboxGridItem().setRows(allDateLabels));
-  form.getItems().filter(it => it.getTitle() === TEMPLATE_ITEM_TITLES.LUNCH_GRID)
-    .forEach(it => it.asCheckboxGridItem().setRows(lunchLabels));
+  // baked in per guest-count branch when the template was built. force:true
+  // because a fresh copy still carries the template's placeholder rows even
+  // though this brand-new form ID has no fingerprint on file yet.
+  applyFormDateLabels(form.getId(), allDateLabels, lunchLabels, { form, force: true, context: 'new form' });
   form.getItems().filter(it => it.getTitle() === TEMPLATE_ITEM_TITLES.FOOTER)
     .forEach(it => it.asSectionHeaderItem().setTitle(configInfo.footerNote));
 
@@ -2294,12 +2568,15 @@ function syncRegistrations() {
   const syncStartedAt = new Date();
   const orderAheadDays = getOrderAheadDays();
 
-  const registryIndex = buildRegistryIndex(registrySheet);
+  // One read of each tab up front; both registry-derived structures below
+  // are built from the same rows rather than scanning the sheet twice.
+  const sessionRows = readAllSectionedRows(registrySheet, HEADERS.Master_Program_Dashboard, 'Event_ID');
+  const registryIndex = buildRegistryIndex(registrySheet, sessionRows);
   const existingRows = readAllSectionedRows(registrantsSheet, HEADERS.Lunch_and_Event_Registrants, 'Event_ID');
   const protectedKeys = getProtectedRegistrantKeys(existingRows);
   const existingRowIndex = getExistingRegistrantIndex(existingRows);
 
-  const formIds = getDistinctFormIds(registrySheet);
+  const formIds = getDistinctFormIds(registrySheet, sessionRows);
   const newRows = [];
 
   formIds.forEach(formId => {
@@ -2312,11 +2589,15 @@ function syncRegistrations() {
     }
 
     const responses = form.getResponses(lastSync);
+    if (responses.length === 0) return; // don't pay for an item index on a form with nothing new
+    const formIndex = getFormItemIndex(form); // ONE getItems() round trip for every response on this form
     responses.forEach(response => {
-      const rowsForResponse = processFormResponse(form, response, registryIndex, protectedKeys, existingRowIndex, orderAheadDays);
+      const rowsForResponse = processFormResponse(formIndex, response, registryIndex, protectedKeys, existingRowIndex, orderAheadDays);
       newRows.push(...rowsForResponse.filter(Boolean));
     });
   });
+
+  flushPersistentRegistries(); // one write for every all-dates entry recorded above
 
   // Catch up "sign up for all dates" registrants on Fixed-series forms
   // whose date list has grown since they originally registered.
@@ -2325,29 +2606,34 @@ function syncRegistrations() {
   const combinedRegistrantRows = existingRows.concat(newRows);
   renderRegistrantsSheet(false, combinedRegistrantRows);
 
-  recomputeEventRegistryCounts(registrySheet, registrantsSheet);
+  // combinedRegistrantRows IS what was just written to the Registrants tab,
+  // so every consumer below can work from it instead of re-reading — except
+  // where renderProgramDashboard()'s triage pass rewrites the tab, which it
+  // reports back via registrantsMoved.
+  recomputeEventRegistryCounts(registrySheet, registrantsSheet, combinedRegistrantRows);
   refreshFormCapacityLabelsForAllForms(registrySheet);
 
-  renderProgramDashboard();
-  updateMasterLunchDashboard();
+  const dashboardResult = renderProgramDashboard(false, { registrantRows: combinedRegistrantRows });
+  updateMasterLunchDashboard(dashboardResult.registrantsMoved ? null : combinedRegistrantRows);
 
+  flushPersistentRegistries();
   setLastSyncTime(syncStartedAt);
   SpreadsheetApp.getActiveSpreadsheet().toast(`Registration sync complete ✅ (${newRows.length} new rows)`, 'Calendar & Form Manager', 5);
 }
 
-function getDistinctFormIds(registrySheet) {
+function getDistinctFormIds(registrySheet, sessionRows) {
   const headers = HEADERS.Master_Program_Dashboard;
-  const rows = readAllSectionedRows(registrySheet, headers, 'Event_ID');
+  const rows = sessionRows || readAllSectionedRows(registrySheet, headers, 'Event_ID');
   const map = getIndexMap(headers);
   const values = rows.map(row => row[map['Form_ID']]);
   return Array.from(new Set(values.filter(Boolean)));
 }
 
 /** Maps "Form_ID|Plain Session Date Label" -> { eventId, maxCapacity, eventDate }. */
-function buildRegistryIndex(registrySheet) {
+function buildRegistryIndex(registrySheet, sessionRows) {
   const index = {};
   const headers = HEADERS.Master_Program_Dashboard;
-  const rows = readAllSectionedRows(registrySheet, headers, 'Event_ID');
+  const rows = sessionRows || readAllSectionedRows(registrySheet, headers, 'Event_ID');
   const map = getIndexMap(headers);
   rows.forEach(row => {
     const formId = row[map['Form_ID']];
@@ -2403,9 +2689,18 @@ function getExistingRegistrantIndex(rows) {
   return index;
 }
 
-/** Pulls a named item's response value out of a FormResponse. Loops ALL items sharing that title (a given title can appear on several branch-specific pages) and returns the first one that was actually part of this respondent's path. */
-function getResponseValueByTitle(form, response, title) {
-  const items = form.getItems().filter(it => it.getTitle() === title);
+/**
+ * Pulls a named item's response value out of a FormResponse. Checks ALL
+ * items sharing that title (a given title appears on several branch-specific
+ * pages) and returns the first one that was actually part of this
+ * respondent's path.
+ *
+ * Takes a formIndex from getFormItemIndex() rather than a Form: this used
+ * to call form.getItems() — a REMOTE call — on every single lookup, and
+ * processFormResponse() makes about ten lookups per response.
+ */
+function getResponseValueByTitle(formIndex, response, title) {
+  const items = formIndex.byTitle[title] || [];
   for (const item of items) {
     const itemResponse = response.getResponseForItem(item);
     if (!itemResponse) continue;
@@ -2426,16 +2721,26 @@ function getResponseValueByTitle(form, response, title) {
  * answer (shouldn't happen for ATTENDANCE_GRID since every branch has one,
  * but LUNCH_GRID is legitimately absent whenever the response predates this
  * form structure or every date on the form is "Not Serving").
+ *
+ * getRows()/getColumns() are themselves remote calls, so the resolved grid
+ * is memoized on the formIndex — every response on a form shares one read.
  */
-function getGridResponseByTitle(form, response, title) {
-  const items = form.getItems().filter(it => it.getTitle() === title);
+function getGridResponseByTitle(formIndex, response, title) {
+  const items = formIndex.byTitle[title] || [];
+  if (!formIndex.gridShapeByItemId) formIndex.gridShapeByItemId = {};
   for (const item of items) {
     const itemResponse = response.getResponseForItem(item);
     if (!itemResponse) continue;
     const values = itemResponse.getResponse();
     if (!values || !Array.isArray(values)) continue;
-    const grid = item.asCheckboxGridItem();
-    return { rows: grid.getRows(), columns: grid.getColumns(), values };
+    const itemId = item.getId();
+    let shape = formIndex.gridShapeByItemId[itemId];
+    if (!shape) {
+      const grid = item.asCheckboxGridItem();
+      shape = { rows: grid.getRows(), columns: grid.getColumns() };
+      formIndex.gridShapeByItemId[itemId] = shape;
+    }
+    return { rows: shape.rows, columns: shape.columns, values };
   }
   return null;
 }
@@ -2449,12 +2754,11 @@ function getGridResponseByTitle(form, response, title) {
  * respondent could never actually see their own note echoed back to them
  * separately from a genuine "anything else" answer.
  */
-function getAdminNotesResponse(form, response) {
-  const allergies = String(getResponseValueByTitle(form, response, TEMPLATE_ITEM_TITLES.ALLERGIES) || '').trim();
+function getAdminNotesResponse(formIndex, response) {
+  const allergies = String(getResponseValueByTitle(formIndex, response, TEMPLATE_ITEM_TITLES.ALLERGIES) || '').trim();
 
-  const items = form.getItems(FormApp.ItemType.PARAGRAPH_TEXT);
   let notes = '';
-  for (const item of items) {
+  for (const item of formIndex.paragraphItems) {
     const itemResponse = response.getResponseForItem(item);
     if (!itemResponse) continue;
     const val = String(itemResponse.getResponse() || '').trim();
@@ -2467,15 +2771,16 @@ function getAdminNotesResponse(form, response) {
   return parts.join(' | ');
 }
 
-function processFormResponse(form, response, registryIndex, protectedKeys, existingRowIndex, orderAheadDays) {
-  const name = getResponseValueByTitle(form, response, TEMPLATE_ITEM_TITLES.NAME) || 'Unknown';
-  const guestCount = parseInt(getResponseValueByTitle(form, response, TEMPLATE_ITEM_TITLES.GUEST_COUNT) || '0', 10);
+function processFormResponse(formIndex, response, registryIndex, protectedKeys, existingRowIndex, orderAheadDays) {
+  const form = formIndex.form;
+  const name = getResponseValueByTitle(formIndex, response, TEMPLATE_ITEM_TITLES.NAME) || 'Unknown';
+  const guestCount = parseInt(getResponseValueByTitle(formIndex, response, TEMPLATE_ITEM_TITLES.GUEST_COUNT) || '0', 10);
   const guestNames = [];
   for (let g = 1; g <= 3; g++) {
-    const gName = getResponseValueByTitle(form, response, `Guest ${g} Name`);
+    const gName = getResponseValueByTitle(formIndex, response, `Guest ${g} Name`);
     if (gName) guestNames.push(gName);
   }
-  const adminNotes = getAdminNotesResponse(form, response);
+  const adminNotes = getAdminNotesResponse(formIndex, response);
   // Points at this specific submission (requires setAllowResponseEdits(true)
   // on the template — see getOrCreateTemplateForm()), not the shared form editor.
   const responseEditUrl = response.getEditResponseUrl();
@@ -2483,10 +2788,10 @@ function processFormResponse(form, response, registryIndex, protectedKeys, exist
   const partyId = response.getId();
   const partySize = 1 + Math.min(guestCount, guestNames.length);
 
-  const attendanceMode = getResponseValueByTitle(form, response, TEMPLATE_ITEM_TITLES.ATTENDANCE_MODE);
+  const attendanceMode = getResponseValueByTitle(formIndex, response, TEMPLATE_ITEM_TITLES.ATTENDANCE_MODE);
   if (attendanceMode === ATTENDANCE_MODE_CHOICES.ALL_DATES) {
     return processAllDatesResponse({
-      form, response, registryIndex, protectedKeys, existingRowIndex, orderAheadDays,
+      formIndex, response, registryIndex, protectedKeys, existingRowIndex, orderAheadDays,
       name, guestCount, guestNames, adminNotes, responseEditUrl, submittedAt, partyId, partySize
     });
   }
@@ -2495,8 +2800,8 @@ function processFormResponse(form, response, registryIndex, protectedKeys, exist
   // which never carry an Attendance Mode question at all. Two roster grids:
   // ATTENDANCE_GRID's rows are every date on the form, LUNCH_GRID's rows are
   // only the lunch-eligible ("not Not-Serving") subset — see buildDateLabelSets().
-  const attendanceGrid = getGridResponseByTitle(form, response, TEMPLATE_ITEM_TITLES.ATTENDANCE_GRID);
-  const lunchGrid = getGridResponseByTitle(form, response, TEMPLATE_ITEM_TITLES.LUNCH_GRID);
+  const attendanceGrid = getGridResponseByTitle(formIndex, response, TEMPLATE_ITEM_TITLES.ATTENDANCE_GRID);
+  const lunchGrid = getGridResponseByTitle(formIndex, response, TEMPLATE_ITEM_TITLES.LUNCH_GRID);
   if (!attendanceGrid) return [];
 
   const people = [{ name, personType: 'Attendee', primaryRegistrant: 'Self', columnLabel: 'You', baseNotes: adminNotes }];
@@ -2557,18 +2862,18 @@ function processFormResponse(form, response, registryIndex, protectedKeys, exist
  */
 function processAllDatesResponse(args) {
   const {
-    form, response, registryIndex, protectedKeys, existingRowIndex, orderAheadDays,
+    formIndex, response, registryIndex, protectedKeys, existingRowIndex, orderAheadDays,
     name, guestCount, guestNames, adminNotes, responseEditUrl, submittedAt, partyId, partySize
   } = args;
 
-  const attendeeLunch = getResponseValueByTitle(form, response, TEMPLATE_ITEM_TITLES.ALL_DATES_ATTENDEE_LUNCH) || 'No Lunch';
+  const attendeeLunch = getResponseValueByTitle(formIndex, response, TEMPLATE_ITEM_TITLES.ALL_DATES_ATTENDEE_LUNCH) || 'No Lunch';
   const people = [{ name, personType: 'Attendee', lunchType: attendeeLunch, primaryRegistrant: 'Self', adminNotes }];
   for (let g = 0; g < Math.min(guestCount, guestNames.length); g++) {
-    const lunch = getResponseValueByTitle(form, response, allDatesGuestLunchTitle(g + 1)) || 'No Lunch';
+    const lunch = getResponseValueByTitle(formIndex, response, allDatesGuestLunchTitle(g + 1)) || 'No Lunch';
     people.push({ name: guestNames[g] || `Guest ${g + 1} of ${name}`, personType: 'Guest', lunchType: lunch, primaryRegistrant: name, adminNotes: '' });
   }
 
-  const formId = form.getId();
+  const formId = formIndex.formId;
   const matchingEntries = Object.keys(registryIndex).filter(k => k.startsWith(`${formId}|`)).map(k => registryIndex[k]);
 
   const rows = [];
@@ -2704,12 +3009,12 @@ function buildRegistrantRow(args) {
 }
 
 /** Recomputes Active_Count / Waitlist_Count / Remaining_Seats / Status on the session table (both Upcoming and Past zones). */
-function recomputeEventRegistryCounts(registrySheet, registrantsSheet) {
+function recomputeEventRegistryCounts(registrySheet, registrantsSheet, registrantRows) {
   const headerRows = findProgramSessionHeaderRows(registrySheet);
   if (headerRows.length === 0) return;
 
   const regMap = getHeaderMapAt(registrySheet, headerRows[0]); // identical column layout at every header row
-  const counts = buildEventCountsFromRegistrants(registrantsSheet);
+  const counts = buildEventCountsFromRegistrants(registrantsSheet, registrantRows);
 
   headerRows.forEach((hRow, i) => {
     const nextHeader = (i + 1 < headerRows.length) ? headerRows[i + 1] : null;
@@ -2719,10 +3024,10 @@ function recomputeEventRegistryCounts(registrySheet, registrantsSheet) {
   });
 }
 
-function buildEventCountsFromRegistrants(registrantsSheet) {
+function buildEventCountsFromRegistrants(registrantsSheet, registrantRows) {
   const counts = {};
   const headers = HEADERS.Lunch_and_Event_Registrants;
-  const rows = readAllSectionedRows(registrantsSheet, headers, 'Event_ID');
+  const rows = registrantRows || readAllSectionedRows(registrantsSheet, headers, 'Event_ID');
   const map = getIndexMap(headers);
   rows.forEach(row => {
     const eventId = row[map['Event_ID']];
@@ -2800,16 +3105,11 @@ function refreshFormCapacityLabelsForAllForms(registrySheet) {
     const capacityHints = buildCapacityHintsFromRegistryRows(formRows, map);
     const { allDateLabels, lunchDateLabels } = buildDateLabelSets(dates, location, capacityHints);
     const lunchLabels = lunchDateLabels.length > 0 ? lunchDateLabels : ['No lunch served for any date on this form'];
-    try {
-      const form = FormApp.openById(formId);
-      form.getItems().filter(it => it.getTitle() === TEMPLATE_ITEM_TITLES.ATTENDANCE_GRID)
-        .forEach(it => it.asCheckboxGridItem().setRows(allDateLabels));
-      form.getItems().filter(it => it.getTitle() === TEMPLATE_ITEM_TITLES.LUNCH_GRID)
-        .forEach(it => it.asCheckboxGridItem().setRows(lunchLabels));
-    } catch (err) {
-      log(`⚠️ Could not refresh capacity labels on form ${formId} (${err}).`);
-    }
+    // Fingerprinted: on the overwhelmingly common "nothing filled up since
+    // last hour" sync this costs a hash compare and no FormApp call at all.
+    applyFormDateLabels(formId, allDateLabels, lunchLabels, { context: 'capacity labels' });
   });
+  flushPersistentRegistries();
 }
 
 
@@ -3067,12 +3367,14 @@ function renderLunchScheduleSheet(force, allRows) {
   const sheet = getOrCreateSheet(ss, SHEET_NAMES.LUNCH_SCHEDULE);
   const headers = HEADERS.Lunch_Schedule;
   const rows = allRows || readAllSectionedRows(sheet, headers, 'Event_Date');
-  return renderFlatDateSheet(sheet, headers, rows, {
+  const result = renderFlatDateSheet(sheet, headers, rows, {
     upcomingLabel: '⏳ Upcoming Menu',
     pastLabel: '🕓 Past Menu',
     force,
     afterWrite: applyLunchScheduleFormatting
   });
+  invalidateMealInfoIndex(); // this tab is exactly what getMealInfoIndex() is built from
+  return result;
 }
 
 function applyLunchScheduleFormatting(sheet, headers, result) {
@@ -3113,7 +3415,15 @@ function applyLunchScheduleFormatting(sheet, headers, result) {
 // Metrics sections, then clears the sheet and writes everything fresh.
 // ============================================================================
 
-function renderProgramDashboard(force) {
+/**
+ * options.registrantRows — already-in-memory Lunch_and_Event_Registrants
+ * rows, to skip re-reading that tab. Honored only when this render's own
+ * triage pass didn't rewrite the tab underneath them (see registrantsMoved).
+ * Returns { registrantsMoved } so a caller holding those rows knows whether
+ * they are still safe to reuse afterward.
+ */
+function renderProgramDashboard(force, options) {
+  options = options || {};
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sheet = getOrCreateSheet(ss, SHEET_NAMES.PROGRAM_DASHBOARD);
   const registrantsSheet = getOrCreateSheet(ss, SHEET_NAMES.LUNCH_EVENT_REGISTRANTS);
@@ -3134,11 +3444,13 @@ function renderProgramDashboard(force) {
     refreshFormDateListsForForms(sessionRows, map, triageResult.affectedFormIds);
   }
 
-  const registrantScan = scanRegistrants(registrantsSheet);
+  const reusableRegistrantRows = triageResult.registrantsMoved ? null : options.registrantRows;
+  const registrantScan = scanRegistrants(registrantsSheet, reusableRegistrantRows);
   const todayData = buildTodayAtLocations(sessionRows, map, registrantScan);
   const metrics = computeProgramMetrics(sessionRows, map, registrantScan);
 
   writeProgramDashboardSheet(sheet, headers, map, sessionRows, todayData, metrics, force);
+  return { registrantsMoved: triageResult.registrantsMoved };
 }
 
 /**
@@ -3151,11 +3463,15 @@ function renderProgramDashboard(force) {
 function triageDeletedSessions(sessionRows, map, registrantsSheet) {
   const { start, end } = computeSyncDateRange();
 
+  // Shares syncCalendarsInternal()'s fetch for this window — a full
+  // initializeAndSyncAll() used to hit every calendar four separate times
+  // (once per renderProgramDashboard(), plus the sync's own scan).
+  const eventsByCalendar = getCalendarEventsForWindow(start, end);
   const liveEventIds = new Set();
   Object.keys(CALENDAR_MAP).forEach(calendarId => {
-    const calendar = CalendarApp.getCalendarById(calendarId);
-    if (!calendar) return;
-    calendar.getEvents(start, end).forEach(ev => {
+    const events = eventsByCalendar[calendarId];
+    if (!events) return;
+    events.forEach(ev => {
       if (ev.isAllDayEvent()) return;
       const parsed = parseEventTitle(ev.getTitle());
       if (!parsed) return;
@@ -3187,7 +3503,10 @@ function triageDeletedSessions(sessionRows, map, registrantsSheet) {
     log(`Triaged ${deletedCount} deleted event(s) during dashboard render.`);
   }
 
-  return { rows: keep, affectedFormIds };
+  // registrantsMoved tells callers that any registrant rows they were
+  // holding from before this call are now stale — moveRegistrantsToTriage()
+  // rewrites the Registrants tab.
+  return { rows: keep, affectedFormIds, registrantsMoved: deletedCount > 0 };
 }
 
 /** After sessions are removed (their calendar event vanished), pushes an updated date list to any form those sessions belonged to. */
@@ -3214,22 +3533,18 @@ function refreshFormDateListsForForms(keptSessionRows, map, affectedFormIds) {
     const { allDateLabels, lunchDateLabels } = buildDateLabelSets(dates, location, capacityHints);
     const attendanceLabels = allDateLabels.length > 0 ? allDateLabels : ['No upcoming dates'];
     const lunchLabels = lunchDateLabels.length > 0 ? lunchDateLabels : ['No upcoming dates'];
-    try {
-      const form = FormApp.openById(formId);
-      form.getItems().filter(it => it.getTitle() === TEMPLATE_ITEM_TITLES.ATTENDANCE_GRID).forEach(it => it.asCheckboxGridItem().setRows(attendanceLabels));
-      form.getItems().filter(it => it.getTitle() === TEMPLATE_ITEM_TITLES.LUNCH_GRID).forEach(it => it.asCheckboxGridItem().setRows(lunchLabels));
+    if (applyFormDateLabels(formId, attendanceLabels, lunchLabels, { context: 'deleted-event cleanup' })) {
       log(`Refreshed form ${formId}'s date list to ${dates.length} remaining date(s) after a deleted-event cleanup.`);
-    } catch (err) {
-      log(`⚠️ Could not refresh date list on form ${formId} after deletion (${err}).`);
     }
   });
+  flushPersistentRegistries();
 }
 
 /** One pass over Lunch_and_Event_Registrants powering BOTH the Today block and the participation metrics. */
-function scanRegistrants(registrantsSheet) {
+function scanRegistrants(registrantsSheet, registrantRows) {
   const result = { countsByEventId: {}, activeNamesByEventId: {} };
   const headers = HEADERS.Lunch_and_Event_Registrants;
-  const rows = readAllSectionedRows(registrantsSheet, headers, 'Event_ID');
+  const rows = registrantRows || readAllSectionedRows(registrantsSheet, headers, 'Event_ID');
   const map = getIndexMap(headers);
   rows.forEach(row => {
     const eventId = row[map['Event_ID']];
@@ -3435,7 +3750,7 @@ function getDashboardRowPlan() {
  * location now). Only rows with Program_Status=Active AND Lunch_Status=Needed
  * count toward catering.
  */
-function buildDashboardRollup() {
+function buildDashboardRollup(registrantRows) {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const registrySheet = ss.getSheetByName(SHEET_NAMES.PROGRAM_DASHBOARD);
   const registrantsSheet = ss.getSheetByName(SHEET_NAMES.LUNCH_EVENT_REGISTRANTS);
@@ -3455,9 +3770,9 @@ function buildDashboardRollup() {
   });
 
   const rollup = {};
-  if (registrantsSheet) {
+  if (registrantsSheet || registrantRows) {
     const lrHeaders = HEADERS.Lunch_and_Event_Registrants;
-    const lrRows = readAllSectionedRows(registrantsSheet, lrHeaders, 'Event_ID');
+    const lrRows = registrantRows || readAllSectionedRows(registrantsSheet, lrHeaders, 'Event_ID');
     const lrMap = getIndexMap(lrHeaders);
     lrRows.forEach(row => {
       const eventId = row[lrMap['Event_ID']];
@@ -3479,13 +3794,13 @@ function buildDashboardRollup() {
   }).sort((a, b) => (a.dateKey === b.dateKey ? a.location.localeCompare(b.location) : (a.dateKey < b.dateKey ? -1 : 1)));
 }
 
-function updateMasterLunchDashboard() {
+function updateMasterLunchDashboard(registrantRows) {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sheet = getOrCreateSheet(ss, SHEET_NAMES.LUNCH_DASHBOARD);
   const headers = HEADERS.Master_Lunch_Dashboard;
   const map = getIndexMap(headers);
   const plan = getDashboardRowPlan();
-  const rollup = buildDashboardRollup();
+  const rollup = buildDashboardRollup(registrantRows);
 
   // 'Standard_Buffer' is unique to the Full Schedule headers (not present
   // on TODAY_LUNCH_HEADERS), so it safely finds only the schedule's own
