@@ -80,10 +80,29 @@
  *      Forms has no default-checked grid, so a prefilled response URL is
  *      the only way to do this; it falls back to the plain published URL if
  *      it can't be built. See that function for the one soft edge.
- *    - THE LUNCH DASHBOARD LISTS EVERY UPCOMING date x location even at
- *      zero registrants, so staff can plan against (and hand-enter buffers
- *      on) dates nobody has signed up for yet. Dates explicitly marked
- *      "Not Serving" are excluded; past dates are never back-seeded.
+ *    - PER-LOCATION CATERING POLICY (Config -> "🍽️ Lunch Service by
+ *      Location") is what keeps the lunch dashboard from filling with blank
+ *      rows. Before it existed the only way to say "Zoom never serves lunch"
+ *      was a per-date "Not Serving" row for every Zoom date forever, so in
+ *      practice those dates read as merely unconfigured — seeded onto the
+ *      dashboard AND asked about on forms. The three postures:
+ *        Always        lunch unless a date says otherwise (a catering site)
+ *        By exception  only dates with a real Hot/Cold row on Lunch_Schedule
+ *        Never         no lunch at all — the location never reaches the
+ *                      lunch dashboard, and createRegistrationForm() strips
+ *                      both lunch questions off its forms entirely
+ *      See isLunchOfferedOn(), which is the single place policy and the
+ *      per-date override are reconciled.
+ *    - THE LUNCH DASHBOARD LISTS EVERY UPCOMING date x location where lunch
+ *      is on the table, even at zero registrants, so staff can plan against
+ *      (and hand-enter buffers on) dates nobody has signed up for yet. Past
+ *      dates are never back-seeded.
+ *    - DEMAND ALWAYS WINS over policy. Policy only decides what gets SEEDED;
+ *      a date somebody is actually registered to eat on always appears, and
+ *      if no Hot/Cold menu backs it, the admin digest says so. That is the
+ *      safety net for "By exception" — forgetting a menu row can leave a
+ *      date off the plan, but never off the plan once a real person is
+ *      expecting to be fed.
  *    - ADMIN NOTIFICATIONS: set an address in Config to get ONE digest per
  *      sync covering only things needing a human — waitlisted registrants,
  *      forms that couldn't be opened, events sent to triage. A sync with
@@ -390,9 +409,14 @@ const CONFIG_LAYOUT = {
     title: '📧 Admin Notifications',
     startCol: 8,
     headers: ['Admin_Notification_Email']
+  },
+  CATERING_POLICY: {
+    title: '🍽️ Lunch Service by Location',
+    startCol: 10,
+    headers: ['Location', 'Catering_Policy']
   }
 };
-const CONFIG_SPACER_COLS = [5, 7];
+const CONFIG_SPACER_COLS = [5, 7, 9];
 const DEFAULT_MEAL_BUFFERS = { standardBufferAmount: 1, testerBufferAmount: 2 };
 const DEFAULT_ORDER_AHEAD_DAYS = 7;
 const CONFIG_HEADER_ROW = 2;
@@ -401,6 +425,47 @@ const CONFIG_DATA_START_ROW = 3;
 const CATERED_LUNCH_TYPES = ['Hot', 'Cold'];
 /** Full set of Type choices offered on Lunch_Schedule / Master_Lunch_Dashboard. */
 const LUNCH_TYPE_OPTIONS = ['Hot', 'Cold', 'Not Serving'];
+
+/**
+ * A location's STANDING catering posture. Until this existed the only way
+ * to say "Zoom never serves lunch" was to hand-add a "Not Serving" row to
+ * Lunch_Schedule for every Zoom date forever — so in practice those dates
+ * read as merely unconfigured, which meant they were seeded onto the lunch
+ * dashboard AND asked about lunch on their registration forms.
+ *
+ *   ALWAYS       Lunch unless told otherwise. Every upcoming date is seeded
+ *                onto the dashboard; a per-date "Not Serving" row suppresses
+ *                individual days. (A normal catering site.)
+ *   BY_EXCEPTION Nothing is assumed. A date shows up only once someone adds
+ *                a real Hot/Cold row for it on Lunch_Schedule. (A site that
+ *                caters occasionally.)
+ *   NEVER        No lunch, ever. The location never appears on the lunch
+ *                dashboard, and its forms don't ask about lunch at all.
+ *
+ * Policy governs what gets SEEDED. Actual registered demand always wins —
+ * see buildDashboardRollup(): if someone is down for lunch on a date, that
+ * date appears no matter the policy, and gets flagged to the admin when
+ * there's no menu behind it.
+ */
+const CATERING_POLICIES = {
+  ALWAYS: 'Always',
+  BY_EXCEPTION: 'By exception',
+  NEVER: 'Never'
+};
+const CATERING_POLICY_OPTIONS = Object.values(CATERING_POLICIES);
+
+/**
+ * Seeded into Config on setup; edit there afterward, not here. An unknown
+ * location falls back to ALWAYS — the safe direction, since a location that
+ * wrongly shows up is a visible nuisance while one that wrongly hides is a
+ * missed lunch order.
+ */
+const DEFAULT_CATERING_POLICY_BY_LOCATION = {
+  Narberth: CATERING_POLICIES.ALWAYS,
+  Ashbridge: CATERING_POLICIES.BY_EXCEPTION,
+  Zoom: CATERING_POLICIES.NEVER
+};
+const FALLBACK_CATERING_POLICY = CATERING_POLICIES.ALWAYS;
 
 const FORM_FOOTER_BY_LOCATION = {
   Narberth: 'Additional notes or dietary needs? Let us know here.',
@@ -1051,6 +1116,7 @@ let __mealInfoIndexCache = null;
 let __mealBufferIndexCache = null;
 let __orderAheadDaysCache = null;
 let __adminNotificationEmailCache = null;
+let __cateringPolicyIndexCache = null;
 let __calendarEventsCache = null;
 let __formItemIndexCache = {};
 
@@ -1098,6 +1164,7 @@ function invalidateConfigCaches() {
   __mealBufferIndexCache = null;
   __orderAheadDaysCache = null;
   __adminNotificationEmailCache = null;
+  __cateringPolicyIndexCache = null;
 }
 
 /**
@@ -1220,10 +1287,7 @@ function buildDateLabelSets(dates, locationName, capacityHints) {
   capacityHints = capacityHints || {};
   const allDateLabels = dates.map(d => formatDateLabelWithMeal(d, locationName, capacityHints[formatDateKey(d)]));
   const lunchDateLabels = dates
-    .filter(d => {
-      const meal = getMealInfoForDate(d, locationName);
-      return !meal || meal.type !== 'Not Serving';
-    })
+    .filter(d => isLunchOfferedOn(d, locationName))
     .map(d => formatDateLabelWithMeal(d, locationName, capacityHints[formatDateKey(d)]));
   return { allDateLabels, lunchDateLabels };
 }
@@ -1399,6 +1463,31 @@ function buildPrefilledAllCheckedUrl(form) {
 /** The link we actually hand out: prefilled-all-checked when we can build one, plain published URL otherwise. */
 function buildRegistrationUrl(form) {
   return buildPrefilledAllCheckedUrl(form) || form.getPublishedUrl();
+}
+
+/**
+ * Strips both lunch questions — the per-date LUNCH_GRID and the all-dates
+ * who-eats checkbox — from a form belonging to a location whose catering
+ * policy is NEVER. Asking a Zoom attendee to pick lunch is noise at best
+ * and a wrong expectation at worst.
+ *
+ * The parser needs no special case for this: getGridResponseByTitle()
+ * returns null when the item is absent and getResponseValueByTitle()
+ * returns '', both of which already resolve to "No Lunch" for everyone.
+ */
+function removeLunchQuestionsFromForm(form, locationName) {
+  const doomed = [TEMPLATE_ITEM_TITLES.LUNCH_GRID, TEMPLATE_ITEM_TITLES.ALL_DATES_LUNCH_PEOPLE];
+  let removed = 0;
+  form.getItems().forEach(item => {
+    if (doomed.indexOf(item.getTitle()) === -1) return;
+    try {
+      form.deleteItem(item);
+      removed++;
+    } catch (err) {
+      log(`⚠️ Could not remove "${item.getTitle()}" from the ${locationName} form (${err}).`);
+    }
+  });
+  if (removed > 0) log(`Removed ${removed} lunch question(s) from a ${locationName} form — that location's catering policy is "${CATERING_POLICIES.NEVER}".`);
 }
 
 
@@ -1745,9 +1834,16 @@ function styleConfigSheet(sheet) {
   applyValueListValidationBounded(sheet, bufferSection.startCol, MEAL_BUFFER_LOCATIONS, CONFIG_DATA_START_ROW, validationRows);
   applyValueListValidationBounded(sheet, bufferSection.startCol + 1, CATERED_LUNCH_TYPES, CONFIG_DATA_START_ROW, validationRows);
 
+  // One policy row per location, so the dropdowns are bounded the same way.
+  const policySection = CONFIG_LAYOUT.CATERING_POLICY;
+  const policyRows = Math.max(Object.keys(CALENDAR_MAP).length, 1);
+  applyValueListValidationBounded(sheet, policySection.startCol, Object.values(CALENDAR_MAP), CONFIG_DATA_START_ROW, policyRows);
+  applyValueListValidationBounded(sheet, policySection.startCol + 1, CATERING_POLICY_OPTIONS, CONFIG_DATA_START_ROW, policyRows);
+
   seedMealBufferRows(sheet);
   seedOrderAheadRow(sheet);
   seedAdminNotificationRow(sheet);
+  seedCateringPolicyRows(sheet);
   invalidateConfigCaches(); // the seeds above may have just written cells the caches were built from
 }
 
@@ -1791,6 +1887,35 @@ function seedOrderAheadRow(sheet) {
  * start mailing someone who never asked for it. Just annotates the cell so
  * it's obvious what goes there.
  */
+/**
+ * Writes one policy row per CALENDAR_MAP location, seeded from
+ * DEFAULT_CATERING_POLICY_BY_LOCATION. Never overwrites a location that
+ * already has a row — this is a setting staff own once it exists.
+ */
+function seedCateringPolicyRows(sheet) {
+  const section = CONFIG_LAYOUT.CATERING_POLICY;
+  const lastRow = sheet.getLastRow();
+  const existing = new Set();
+  if (lastRow >= CONFIG_DATA_START_ROW) {
+    sheet.getRange(CONFIG_DATA_START_ROW, section.startCol, lastRow - CONFIG_DATA_START_ROW + 1, 1)
+      .getValues()
+      .forEach(([loc]) => { const v = String(loc || '').trim(); if (v) existing.add(v); });
+  }
+
+  const rowsToAdd = Object.values(CALENDAR_MAP)
+    .filter(loc => !existing.has(loc))
+    .map(loc => [loc, DEFAULT_CATERING_POLICY_BY_LOCATION[loc] || FALLBACK_CATERING_POLICY]);
+  if (rowsToAdd.length === 0) return;
+
+  const startRow = Math.max(lastRow + 1, CONFIG_DATA_START_ROW);
+  sheet.getRange(startRow, section.startCol, rowsToAdd.length, section.headers.length).setValues(rowsToAdd);
+  sheet.getRange(startRow, section.startCol + 1, rowsToAdd.length, 1).setNote(
+    'Always = lunch unless a date is marked Not Serving.\n'
+    + 'By exception = only dates with a Hot/Cold row on Lunch_Schedule.\n'
+    + 'Never = no lunch at all; hidden from the lunch dashboard and not asked about on forms.');
+  log(`Seeded ${rowsToAdd.length} Lunch Service by Location row(s) on "${SHEET_NAMES.CONFIG}".`);
+}
+
 function seedAdminNotificationRow(sheet) {
   const section = CONFIG_LAYOUT.ADMIN_NOTIFICATIONS;
   const cell = sheet.getRange(CONFIG_DATA_START_ROW, section.startCol);
@@ -1842,6 +1967,59 @@ function getMealBufferIndex() {
   }
   __mealBufferIndexCache = index;
   return index;
+}
+
+/**
+ * Reads Config's "Lunch Service by Location" section ONCE per execution
+ * into { Location: policy }. Anything not listed — or listed with an
+ * unrecognized value — falls back to FALLBACK_CATERING_POLICY.
+ */
+function getCateringPolicyIndex() {
+  if (__cateringPolicyIndexCache) return __cateringPolicyIndexCache;
+  const index = {};
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss ? ss.getSheetByName(SHEET_NAMES.CONFIG) : null;
+  const lastRow = sheet ? sheet.getLastRow() : 0;
+  if (sheet && lastRow >= CONFIG_DATA_START_ROW) {
+    const section = CONFIG_LAYOUT.CATERING_POLICY;
+    const numRows = lastRow - CONFIG_DATA_START_ROW + 1;
+    const data = sheet.getRange(CONFIG_DATA_START_ROW, section.startCol, numRows, section.headers.length).getValues();
+    data.forEach(([loc, policy]) => {
+      const location = String(loc || '').trim();
+      const value = String(policy || '').trim();
+      if (!location || index[location] !== undefined) return;
+      if (CATERING_POLICY_OPTIONS.indexOf(value) === -1) return;
+      index[location] = value;
+    });
+  }
+  __cateringPolicyIndexCache = index;
+  return index;
+}
+
+/** A location's standing lunch posture — see CATERING_POLICIES. */
+function getCateringPolicyForLocation(locationName) {
+  const key = String(locationName || '').trim();
+  const configured = getCateringPolicyIndex()[key];
+  if (configured) return configured;
+  return DEFAULT_CATERING_POLICY_BY_LOCATION[key] || FALLBACK_CATERING_POLICY;
+}
+
+/**
+ * Should this date+location be OFFERED lunch — on the form, and seeded onto
+ * the lunch dashboard? Policy sets the default; an explicit Lunch_Schedule
+ * row can always override in either direction.
+ */
+function isLunchOfferedOn(date, locationName) {
+  const policy = getCateringPolicyForLocation(locationName);
+  if (policy === CATERING_POLICIES.NEVER) return false;
+
+  const meal = getMealInfoForDate(date, locationName);
+  if (meal && meal.type === 'Not Serving') return false;
+  if (policy === CATERING_POLICIES.BY_EXCEPTION) {
+    // Nothing assumed: a real catered menu row has to exist for this date.
+    return !!meal && CATERED_LUNCH_TYPES.indexOf(meal.type) !== -1;
+  }
+  return true; // ALWAYS
 }
 
 function getOrderAheadDays() {
@@ -2736,10 +2914,17 @@ function createRegistrationForm(group, locationName, configInfo) {
 
   form.setDescription(buildFormDescription(locationName, allDateLabels, group.isFixed));
 
+  // A location that never caters shouldn't be asking about lunch at all.
+  // Done on this fresh copy only — it's a structural edit, so it happens
+  // once at creation rather than on every refresh.
+  if (getCateringPolicyForLocation(locationName) === CATERING_POLICIES.NEVER) {
+    removeLunchQuestionsFromForm(form, locationName);
+  }
+
   // Only ROWS are set here — grid COLUMNS (the person labels) were already
-  // baked in per guest-count branch when the template was built. force:true
-  // because a fresh copy still carries the template's placeholder rows even
-  // though this brand-new form ID has no fingerprint on file yet.
+  // baked into the template. force:true because a fresh copy still carries
+  // the template's placeholder rows even though this brand-new form ID has
+  // no fingerprint on file yet.
   applyFormDateLabels(form.getId(), allDateLabels, lunchLabels, { form, force: true, context: 'new form' });
   form.getItems().filter(it => it.getTitle() === TEMPLATE_ITEM_TITLES.FOOTER)
     .forEach(it => it.asSectionHeaderItem().setTitle(configInfo.footerNote));
@@ -4117,14 +4302,16 @@ function buildDashboardRollup(registrantRows) {
 
   const rollup = {};
 
-  // Seed every upcoming date+location at 0 so the schedule shows what's
-  // coming rather than only what's already been registered for.
+  // Seed upcoming date+location pairs at 0 so the schedule shows what's
+  // coming rather than only what's already been registered for — but only
+  // where the location's catering policy says lunch is on the table. Without
+  // this filter a never-catering location (Zoom) contributes a blank row for
+  // every single session it runs. See isLunchOfferedOn().
   const todayKey = formatDateKey(new Date());
   Object.keys(eventMeta).forEach(eventId => {
     const meta = eventMeta[eventId];
     if (!meta.location || meta.dateKey < todayKey) return;
-    const meal = getMealInfoForDate(parseDateKey(meta.dateKey), meta.location);
-    if (meal && meal.type === 'Not Serving') return; // nothing is catered that day, by design
+    if (!isLunchOfferedOn(parseDateKey(meta.dateKey), meta.location)) return;
     const key = `${meta.dateKey}|${meta.location}`;
     if (!rollup[key]) rollup[key] = { dateKey: meta.dateKey, location: meta.location, registeredCount: 0 };
   });
@@ -4139,11 +4326,31 @@ function buildDashboardRollup(registrantRows) {
       if (!meta) return;
       if (row[lrMap['Program_Status']] !== 'Active' || row[lrMap['Lunch_Status']] !== 'Needed') return;
 
+      // DEMAND ALWAYS WINS. Policy decides what gets seeded; it never
+      // suppresses a date somebody is actually signed up to eat on. This is
+      // the safety net for "By exception" — forgetting to add the menu row
+      // can make a date invisible on the schedule, but never invisible once
+      // a real person is expecting lunch.
       const key = `${meta.dateKey}|${meta.location}`;
-      if (!rollup[key]) rollup[key] = { dateKey: meta.dateKey, location: meta.location, registeredCount: 0 };
+      if (!rollup[key]) {
+        rollup[key] = { dateKey: meta.dateKey, location: meta.location, registeredCount: 0, unplanned: true };
+      }
       rollup[key].registeredCount++;
     });
   }
+
+  // Anything that only exists because someone registered for it, on a date
+  // with no catered menu behind it, is worth telling a human about.
+  Object.keys(rollup).forEach(key => {
+    const r = rollup[key];
+    if (!r.unplanned || r.registeredCount === 0 || r.dateKey < todayKey) return;
+    const meal = getMealInfoForDate(parseDateKey(r.dateKey), r.location);
+    const hasMenu = !!meal && CATERED_LUNCH_TYPES.indexOf(meal.type) !== -1;
+    if (hasMenu) return;
+    noteForAdmin('Lunch needed with no menu set',
+      `${r.registeredCount} person(s) need lunch at ${r.location} on ${formatDateLabel(parseDateKey(r.dateKey))}, ` +
+      `but Lunch_Schedule has no Hot/Cold row for it.`);
+  });
 
   return Object.values(rollup).map(r => {
     const meal = getMealInfoForDate(parseDateKey(r.dateKey), r.location);

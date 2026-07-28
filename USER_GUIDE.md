@@ -96,9 +96,11 @@ calendar event.
 What to order. **Today's Lunch Needs** sits at the top and always stays visible.
 Below it is the full schedule, split upcoming/past.
 
-Every **upcoming** date and location appears here **even with zero registrants**,
-so you can plan ahead and enter buffers before anyone signs up. Dates you've
-marked *Not Serving* are left out.
+Every **upcoming** date and location where lunch is on the table appears here
+**even with zero registrants**, so you can plan ahead and enter buffers before
+anyone signs up. What counts as "on the table" is set per location in Config
+under **Lunch Service by Location** — that's what keeps Zoom (which never serves
+lunch) from adding a blank row for every session it runs.
 
 Columns with a **✍️ pencil and a yellow header are yours to fill in** — the
 system never overwrites them:
@@ -148,13 +150,31 @@ doesn't exist. Editing this tab immediately pushes updated labels to the
 affected forms.
 
 ### 5. Config
-Three small settings blocks:
+Four small settings blocks:
 
 - **🍱 Meal Buffer Amounts** — extra meals per Location × Hot/Cold, used to
   pre-fill new lunch rows
 - **⏰ Order Ahead Time** — how many days' notice you need. Registrations
   inside that window get flagged.
 - **📧 Admin Notifications** — one email address (optional)
+- **🍽️ Lunch Service by Location** — see below
+
+**Lunch Service by Location** is what keeps the lunch dashboard from filling up
+with empty rows. Each location gets one of three settings:
+
+| Setting | Use it when | Effect |
+|---|---|---|
+| **Always** | The location normally serves lunch | Every upcoming date is listed. Mark a specific day `Not Serving` on Lunch_Schedule to skip it. |
+| **By exception** | Lunch happens occasionally | Nothing is listed until you add a Hot/Cold row for that date on Lunch_Schedule |
+| **Never** | The location can't serve lunch at all | Never appears on the lunch dashboard, and its registration forms **don't ask about lunch** |
+
+Defaults are Narberth = Always, Ashbridge = By exception, Zoom = Never. Change
+them in Config any time; you don't need to touch the code.
+
+> **You can't accidentally starve anyone with this.** The setting only controls
+> what's listed *in advance*. If someone actually registers for lunch on a date,
+> that date shows up regardless — and if there's no menu behind it, it goes in
+> the admin email as "lunch needed with no menu set."
 
 If you set the email, you get **at most one message per sync**, and only when
 something needs a person: waitlisted registrants, forms that couldn't be opened,
@@ -311,6 +331,16 @@ submitted twice) or `Waitlisted` (session was full).
 **The lunch count looks too low**
 Only `Active` + `Needed` rows count. Check for rows sitting at `Waitlisted`,
 `Cancelled`, or `Superseded`.
+
+**A date I expected isn't on the lunch dashboard**
+Check that location's **Lunch Service by Location** setting in Config. If it's
+*By exception*, the date only appears once you add a Hot/Cold row for it on
+**Lunch_Schedule**. If it's *Never*, it won't appear at all.
+
+**A form isn't asking about lunch**
+That location is set to *Never* in Config. Change it to *Always* or
+*By exception* — note that forms already created keep their current shape, so
+you may need to let a new form be generated.
 
 **Nothing is syncing at all**
 Run **Check Triggers**. If that doesn't help, the script may need to be
