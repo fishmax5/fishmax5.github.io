@@ -17,10 +17,11 @@
  *      at the very top) + the full catering schedule, now likewise split
  *      into "Upcoming Lunch Schedule" / "Past Lunch Schedule" sub-tables.
  *    - Lunch_and_Event_Registrants : one row per person per session, split
- *      into "Upcoming Registrants" / "Past Registrants" sub-tables. Keeps
- *      Manual_Override (still second column, right after Event_Date) and
- *      the Order_Ahead_Flag introduced earlier, plus Party_ID/Party_Size
- *      (see below) inserted right after Primary_Registrant.
+ *      into "Upcoming Registrants" / "Past Registrants" sub-tables. Leads
+ *      with Location and Event so staff never scroll to see which program
+ *      a row belongs to, keeps Manual_Override and Order_Ahead_Flag, and
+ *      trails with Party_ID (an internal grouping key — see Party_ID/
+ *      Party_Size below) as the very last column.
  *    - Lunch_Schedule           : the day-by-day catering menu, now broken
  *      down PER LOCATION (one row per Event_Date x Location), with a
  *      "Not Serving" Type option — when a form covers a date that's marked
@@ -356,13 +357,15 @@ const HEADERS = {
   // Order_Ahead_Flag is computed once, at import time, and never recomputed
   // afterward — a registration's notice period is a fact about when it
   // happened, not something that should drift if Config changes later.
-  // Party_ID (the Form response ID) and Party_Size (headcount on that
-  // submission, registrant included) are stamped identically on every row
-  // from the same submission.
+  // Location and Event lead the row so staff never have to scroll to see
+  // which program a registrant belongs to. Party_ID (the Form response ID)
+  // sits at the very end — it's an internal grouping key, not something
+  // staff read first; Party_Size (the headcount on that submission) stays
+  // up front near the person since it IS worth reading at a glance.
   Lunch_and_Event_Registrants: [
-    'Event_Date', 'Manual_Override', 'Name', 'Person_Type', 'Lunch_Type', 'Primary_Registrant',
-    'Party_ID', 'Party_Size', 'Form_Source', 'Program_Status', 'Lunch_Status', 'Order_Ahead_Flag',
-    'Admin_Notes', 'Event_ID'
+    'Location', 'Event', 'Event_Date', 'Manual_Override', 'Name', 'Person_Type', 'Lunch_Type',
+    'Primary_Registrant', 'Party_Size', 'Form_Source', 'Program_Status', 'Lunch_Status',
+    'Order_Ahead_Flag', 'Admin_Notes', 'Event_ID', 'Party_ID'
   ],
   Master_Lunch_Dashboard: [
     'Event_Date', 'Manual_Override', 'Location', 'Lunch_Type', 'Meal_Shorthand', 'Registered_Count',
@@ -373,10 +376,16 @@ const HEADERS = {
   // Now one row per Event_Date PER LOCATION. Type includes "Not Serving"
   // (see CATERED_LUNCH_TYPES vs LUNCH_TYPE_OPTIONS below).
   Lunch_Schedule: ['Event_Date', 'Location', 'Type', 'Meal_Description', 'Meal_Shorthand'],
+  // A superset of Lunch_and_Event_Registrants' own array (same columns, same
+  // order) plus 4 triage-only columns — moveRegistrantsToTriage() copies by
+  // HEADER NAME, so keeping this a true prefix-plus-extra of the Registrants
+  // array is what keeps every registrant column (Location/Event included)
+  // landing in triage rows automatically, with no per-column wiring.
   Deleted_Event_Triage: [
-    'Event_Date', 'Manual_Override', 'Name', 'Person_Type', 'Lunch_Type', 'Primary_Registrant',
-    'Party_ID', 'Party_Size', 'Form_Source', 'Program_Status', 'Lunch_Status', 'Order_Ahead_Flag',
-    'Admin_Notes', 'Event_ID', 'Deleted_Event_Title', 'Deleted_Event_Location', 'Flagged_Date', 'Triage_Notes'
+    'Location', 'Event', 'Event_Date', 'Manual_Override', 'Name', 'Person_Type', 'Lunch_Type',
+    'Primary_Registrant', 'Party_Size', 'Form_Source', 'Program_Status', 'Lunch_Status',
+    'Order_Ahead_Flag', 'Admin_Notes', 'Event_ID', 'Party_ID',
+    'Deleted_Event_Title', 'Deleted_Event_Location', 'Flagged_Date', 'Triage_Notes'
   ]
 };
 
@@ -425,6 +434,8 @@ const CONFIG_DATA_START_ROW = 3;
 const CATERED_LUNCH_TYPES = ['Hot', 'Cold'];
 /** Full set of Type choices offered on Lunch_Schedule / Master_Lunch_Dashboard. */
 const LUNCH_TYPE_OPTIONS = ['Hot', 'Cold', 'Not Serving'];
+/** Lunch_and_Event_Registrants' own Lunch_Type domain — a PERSON'S lunch is Hot, Cold, or none, never "Not Serving" (that's a day-level fact). */
+const REGISTRANT_LUNCH_TYPE_OPTIONS = ['Hot', 'Cold', 'No Lunch'];
 
 /**
  * A location's STANDING catering posture. Until this existed the only way
@@ -1850,10 +1861,14 @@ function styleConfigSheet(sheet) {
 /** Pre-fills the fixed Location x Hot/Cold combinations if they aren't already present. Never overwrites an existing combo's row. */
 function seedMealBufferRows(sheet) {
   const section = CONFIG_LAYOUT.MEAL_BUFFERS;
-  const lastRow = sheet.getLastRow();
+  // Scanned across the sheet's full current height so an existing combo
+  // sitting past this section's own data (because some OTHER section is
+  // currently taller) is still found — see the startRow comment below for
+  // why that same wide scan must NOT be used to decide where to append.
+  const sheetLastRow = sheet.getLastRow();
   const existingCombos = new Set();
-  if (lastRow >= CONFIG_DATA_START_ROW) {
-    const existing = sheet.getRange(CONFIG_DATA_START_ROW, section.startCol, lastRow - CONFIG_DATA_START_ROW + 1, 2).getValues();
+  if (sheetLastRow >= CONFIG_DATA_START_ROW) {
+    const existing = sheet.getRange(CONFIG_DATA_START_ROW, section.startCol, sheetLastRow - CONFIG_DATA_START_ROW + 1, 2).getValues();
     existing.forEach(([loc, type]) => { if (loc && type) existingCombos.add(`${loc}|${type}`); });
   }
 
@@ -1867,7 +1882,14 @@ function seedMealBufferRows(sheet) {
   });
   if (rowsToAdd.length === 0) return;
 
-  const startRow = Math.max(lastRow + 1, CONFIG_DATA_START_ROW);
+  // Deliberately NOT sheet.getLastRow(): that's the tallest column on the
+  // WHOLE sheet, not this section's own. Once any other Config section is
+  // taller than this one, appending at sheetLastRow + 1 pushes these rows
+  // down into that other section's column range instead of stacking under
+  // this section's own existing rows. existingCombos.size IS this section's
+  // own row count (it counts real Location+Type rows already present), so
+  // it's what "the next empty row in THIS column" actually means.
+  const startRow = CONFIG_DATA_START_ROW + existingCombos.size;
   sheet.getRange(startRow, section.startCol, rowsToAdd.length, section.headers.length).setValues(rowsToAdd);
   log(`Seeded ${rowsToAdd.length} Meal Buffer Amounts row(s) on "${SHEET_NAMES.CONFIG}".`);
 }
@@ -1882,22 +1904,16 @@ function seedOrderAheadRow(sheet) {
 }
 
 /**
- * Leaves the admin email BLANK on purpose — an empty cell means "don't
- * send anything," and guessing an address (the current user's, say) would
- * start mailing someone who never asked for it. Just annotates the cell so
- * it's obvious what goes there.
- */
-/**
  * Writes one policy row per CALENDAR_MAP location, seeded from
  * DEFAULT_CATERING_POLICY_BY_LOCATION. Never overwrites a location that
  * already has a row — this is a setting staff own once it exists.
  */
 function seedCateringPolicyRows(sheet) {
   const section = CONFIG_LAYOUT.CATERING_POLICY;
-  const lastRow = sheet.getLastRow();
+  const sheetLastRow = sheet.getLastRow(); // see seedMealBufferRows() for why this is scan-only, never append-math
   const existing = new Set();
-  if (lastRow >= CONFIG_DATA_START_ROW) {
-    sheet.getRange(CONFIG_DATA_START_ROW, section.startCol, lastRow - CONFIG_DATA_START_ROW + 1, 1)
+  if (sheetLastRow >= CONFIG_DATA_START_ROW) {
+    sheet.getRange(CONFIG_DATA_START_ROW, section.startCol, sheetLastRow - CONFIG_DATA_START_ROW + 1, 1)
       .getValues()
       .forEach(([loc]) => { const v = String(loc || '').trim(); if (v) existing.add(v); });
   }
@@ -1907,7 +1923,13 @@ function seedCateringPolicyRows(sheet) {
     .map(loc => [loc, DEFAULT_CATERING_POLICY_BY_LOCATION[loc] || FALLBACK_CATERING_POLICY]);
   if (rowsToAdd.length === 0) return;
 
-  const startRow = Math.max(lastRow + 1, CONFIG_DATA_START_ROW);
+  // existing.size IS this section's own row count so far — NOT
+  // sheet.getLastRow(), which by the time this runs (fourth of four Config
+  // seeds) reflects whichever section is tallest and would append these
+  // rows into that section's row range instead of this one's. This is what
+  // put "Lunch Service by Location" at rows 7-9 instead of 3-5 the first
+  // time this ran, once Meal Buffer Amounts had already filled rows 3-6.
+  const startRow = CONFIG_DATA_START_ROW + existing.size;
   sheet.getRange(startRow, section.startCol, rowsToAdd.length, section.headers.length).setValues(rowsToAdd);
   sheet.getRange(startRow, section.startCol + 1, rowsToAdd.length, 1).setNote(
     'Always = lunch unless a date is marked Not Serving.\n'
@@ -1916,6 +1938,12 @@ function seedCateringPolicyRows(sheet) {
   log(`Seeded ${rowsToAdd.length} Lunch Service by Location row(s) on "${SHEET_NAMES.CONFIG}".`);
 }
 
+/**
+ * Leaves the admin email BLANK on purpose — an empty cell means "don't
+ * send anything," and guessing an address (the current user's, say) would
+ * start mailing someone who never asked for it. Just annotates the cell so
+ * it's obvious what goes there.
+ */
 function seedAdminNotificationRow(sheet) {
   const section = CONFIG_LAYOUT.ADMIN_NOTIFICATIONS;
   const cell = sheet.getRange(CONFIG_DATA_START_ROW, section.startCol);
@@ -2866,6 +2894,14 @@ function refreshFormForNewDates(formId, group, locationName, configInfo) {
 
   form.setDescription(buildFormDescription(locationName, allDateLabels, group.isFixed));
 
+  // Catches a form that predates this location's policy being set to
+  // Never, or predates the policy feature entirely — removeLunchQuestionsFromForm()
+  // is a no-op once the questions are already gone, so this is cheap on
+  // every subsequent call.
+  if (getCateringPolicyForLocation(locationName) === CATERING_POLICIES.NEVER) {
+    removeLunchQuestionsFromForm(form, locationName);
+  }
+
   // Only ROWS are refreshed here — grid COLUMNS (the person labels) are
   // fixed per guest-count branch at template-build time and never touched again.
   applyFormDateLabels(formId, allDateLabels, lunchLabels, { form, context: 'new dates on an existing form' });
@@ -3144,7 +3180,9 @@ function buildRegistryIndex(registrySheet, sessionRows) {
     index[`${formId}|${label}`] = {
       eventId: row[map['Event_ID']],
       maxCapacity: Number(row[map['Max_Capacity']]) || 0,
-      eventDate
+      eventDate,
+      location: row[map['Location']] || '',
+      cleanTitle: row[map['Clean_Title']] || ''
     };
   });
   return index;
@@ -3449,6 +3487,28 @@ function supersedeRegistrantRow(row, map, supersededAt) {
   row[map['Admin_Notes']] = existingNotes ? `${existingNotes} | ${note}` : note;
 }
 
+/**
+ * Resolves what actually gets STORED in a registrant row's Lunch_Type
+ * column: the day's real Hot/Cold designation (from Lunch_Schedule, via
+ * registryEntry's own date+location) for anyone who wants lunch, 'No Lunch'
+ * for anyone who doesn't. Never returns the raw form answer verbatim — a
+ * person's lunch type is Hot or Cold, matching Lunch_Schedule's own
+ * vocabulary, not a restatement of whether they said yes.
+ *
+ * Resolved ONCE at row-creation/patch time and never revisited — like
+ * Order_Ahead_Flag, it's a fact about what Lunch_Schedule said when this
+ * row was written, not something that should drift if the menu changes
+ * later. If no Hot/Cold row exists yet for that date, this returns '' —
+ * still correctly counted as Needed (see lunchStatus below, which is
+ * derived from wantsLunch directly, never from this string) and already
+ * surfaced separately by buildDashboardRollup()'s "no menu set" admin note.
+ */
+function resolveRegistrantLunchType(wantsLunch, registryEntry) {
+  if (!wantsLunch) return 'No Lunch';
+  const meal = getMealInfoForDate(registryEntry.eventDate, registryEntry.location);
+  return (meal && (meal.type === 'Hot' || meal.type === 'Cold')) ? meal.type : '';
+}
+
 function buildRegistrantRow(args) {
   const {
     registryEntry, name, personType, lunchType, primaryRegistrant, adminNotes, formEditUrl,
@@ -3456,6 +3516,12 @@ function buildRegistrantRow(args) {
   } = args;
   const displayName = String(name || '').trim();
   const key = `${registryEntry.eventId}|${normalizeNameKey(displayName)}|${personType}`;
+  // The caller's lunchType is just an intent signal ('No Lunch' vs
+  // anything else) — resolveRegistrantLunchType() is what turns that into
+  // an actual Hot/Cold value. Deriving lunchStatus from this boolean rather
+  // than from the resolved string means an unresolved Hot/Cold (no menu
+  // configured yet) never downgrades a real "Needed" registrant.
+  const wantsLunch = !!lunchType && lunchType !== 'No Lunch';
 
   if (protectedKeys.has(key)) {
     return null; // never overwrite a manually-edited/added row, resubmission or not
@@ -3472,10 +3538,10 @@ function buildRegistrantRow(args) {
       // form.setAllowResponseEdits(true) in getOrCreateTemplateForm()), so
       // this is the SAME submission being re-seen, not a new one. Refresh
       // the one row in place rather than appending a duplicate.
-      existingRow[map['Lunch_Type']] = lunchType;
+      existingRow[map['Lunch_Type']] = resolveRegistrantLunchType(wantsLunch, registryEntry);
       existingRow[map['Lunch_Status']] = existingRow[map['Program_Status']] === 'Waitlisted'
         ? 'Waitlisted'
-        : (lunchType && lunchType !== 'No Lunch' ? 'Needed' : 'No Lunch');
+        : (wantsLunch ? 'Needed' : 'No Lunch');
       existingRow[map['Admin_Notes']] = adminNotes || '';
       existingRow[map['Party_Size']] = partySize || '';
       existingRow[map['Order_Ahead_Flag']] = computeOrderAheadFlag(registryEntry.eventDate, submittedAt, orderAheadDays);
@@ -3494,7 +3560,7 @@ function buildRegistrantRow(args) {
     ? 'Waitlisted' : 'Active';
   const lunchStatus = programStatus === 'Waitlisted'
     ? 'Waitlisted'
-    : (lunchType && lunchType !== 'No Lunch' ? 'Needed' : 'No Lunch');
+    : (wantsLunch ? 'Needed' : 'No Lunch');
 
   if (programStatus === 'Waitlisted') {
     // Someone just hit a cap. That's the one registration outcome a human
@@ -3507,11 +3573,13 @@ function buildRegistrantRow(args) {
 
   const row = new Array(HEADERS.Lunch_and_Event_Registrants.length).fill('');
 
+  row[map['Location']] = registryEntry.location || '';
+  row[map['Event']] = registryEntry.cleanTitle || '';
   row[map['Event_Date']] = registryEntry.eventDate;
   row[map['Manual_Override']] = 'Auto-Synced';
   row[map['Name']] = displayName;
   row[map['Person_Type']] = personType;
-  row[map['Lunch_Type']] = lunchType;
+  row[map['Lunch_Type']] = resolveRegistrantLunchType(wantsLunch, registryEntry);
   row[map['Primary_Registrant']] = primaryRegistrant;
   row[map['Party_ID']] = partyId || '';
   row[map['Party_Size']] = partySize || '';
@@ -3630,6 +3698,50 @@ function refreshFormCapacityLabelsForAllForms(registrySheet) {
     applyFormDateLabels(formId, allDateLabels, lunchLabels, { context: 'capacity labels' });
   });
   flushPersistentRegistries();
+}
+
+/**
+ * ONE-TIME MAINTENANCE — run from the Apps Script editor, not wired to any
+ * sync or the menu. createRegistrationForm() strips lunch questions off a
+ * NEVER-policy location's form at creation, and refreshFormForNewDates()
+ * catches up an existing form the next time it gains new dates — but a
+ * form that already exists AND isn't due for new dates soon just sits with
+ * stale lunch questions on it until one of those paths touches it. This
+ * sweeps every currently-live form for a NEVER-policy location right now.
+ *
+ * Safe to run any time: removeLunchQuestionsFromForm() is a no-op on a form
+ * that's already clean, so re-running this costs a few FormApp calls and
+ * changes nothing.
+ */
+function cleanupNeverPolicyForms() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const registrySheet = ss.getSheetByName(SHEET_NAMES.PROGRAM_DASHBOARD);
+  if (!registrySheet) return;
+
+  const headers = HEADERS.Master_Program_Dashboard;
+  const rows = readAllSectionedRows(registrySheet, headers, 'Event_ID');
+  const map = getIndexMap(headers);
+
+  const locationByForm = {};
+  rows.forEach(row => {
+    const formId = row[map['Form_ID']];
+    const location = row[map['Location']];
+    if (!formId || !location) return;
+    if (!locationByForm[formId]) locationByForm[formId] = location;
+  });
+
+  let checked = 0;
+  Object.keys(locationByForm).forEach(formId => {
+    const location = locationByForm[formId];
+    if (getCateringPolicyForLocation(location) !== CATERING_POLICIES.NEVER) return;
+    checked++;
+    try {
+      removeLunchQuestionsFromForm(FormApp.openById(formId), location);
+    } catch (err) {
+      log(`⚠️ cleanupNeverPolicyForms: could not open form ${formId} for "${location}" (${err}).`);
+    }
+  });
+  log(`cleanupNeverPolicyForms: checked ${checked} form(s) at Never-policy location(s).`);
 }
 
 
@@ -3847,6 +3959,7 @@ function applyRegistrantsFormatting(sheet, headers, result) {
     applyManualOverrideValidationBounded(sheet, map['Manual_Override'] + 1, z.start, z.count);
     applyValueListValidationBounded(sheet, map['Program_Status'] + 1, PROGRAM_STATUS_OPTIONS, z.start, z.count);
     applyValueListValidationBounded(sheet, map['Lunch_Status'] + 1, LUNCH_STATUS_OPTIONS, z.start, z.count);
+    applyValueListValidationBounded(sheet, map['Lunch_Type'] + 1, REGISTRANT_LUNCH_TYPE_OPTIONS, z.start, z.count);
   });
 
   const overrideCol = map['Manual_Override'] + 1;
@@ -4326,11 +4439,27 @@ function buildDashboardRollup(registrantRows) {
       if (!meta) return;
       if (row[lrMap['Program_Status']] !== 'Active' || row[lrMap['Lunch_Status']] !== 'Needed') return;
 
-      // DEMAND ALWAYS WINS. Policy decides what gets seeded; it never
-      // suppresses a date somebody is actually signed up to eat on. This is
-      // the safety net for "By exception" — forgetting to add the menu row
-      // can make a date invisible on the schedule, but never invisible once
-      // a real person is expecting lunch.
+      if (getCateringPolicyForLocation(meta.location) === CATERING_POLICIES.NEVER) {
+        // NEVER is a hard fact ("this location cannot serve food"), not a
+        // scheduling gap — so unlike ALWAYS/BY_EXCEPTION below, demand does
+        // NOT override it. A row like this is a data artifact, almost
+        // always a form that still asked about lunch before its location
+        // was set to Never (createRegistrationForm()/refreshFormForNewDates()
+        // strip that question going forward, but can't undo an answer
+        // someone already submitted). Flag it for cleanup instead of
+        // putting a blank row on the dashboard.
+        noteForAdmin('Lunch needed at a Never-catering location',
+          `${row[lrMap['Name']]} is marked Lunch_Status=Needed for ${meta.location} on ` +
+          `${formatDateLabel(parseDateKey(meta.dateKey))}, but that location's policy is "Never." ` +
+          `Probably a stale form answer — fix their Lunch_Status on Lunch_and_Event_Registrants.`);
+        return;
+      }
+
+      // DEMAND ALWAYS WINS (for ALWAYS/BY_EXCEPTION). Policy decides what
+      // gets SEEDED; it never suppresses a date somebody is actually signed
+      // up to eat on. This is the safety net for "By exception" — forgetting
+      // to add the menu row can make a date invisible on the schedule, but
+      // never invisible once a real person is expecting lunch.
       const key = `${meta.dateKey}|${meta.location}`;
       if (!rollup[key]) {
         rollup[key] = { dateKey: meta.dateKey, location: meta.location, registeredCount: 0, unplanned: true };

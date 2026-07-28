@@ -114,20 +114,30 @@ Tester_Buffer`.
 
 ### 3. Lunch_and_Event_Registrants
 One row **per person, per session** — guests get their own rows, not a note on
-someone else's.
+someone else's. `Location` and `Event` lead the row, so you never have to
+scroll to see which program a registrant belongs to.
 
 | Column | What it tells you |
 |---|---|
+| `Location` / `Event` | Which program and location this row belongs to |
 | `Person_Type` | `Attendee` (registered themselves) or `Guest` |
+| `Lunch_Type` | `Hot`, `Cold`, or `No Lunch` — the actual dish category, not just yes/no |
 | `Primary_Registrant` | `Self`, or the name of whoever brought them |
-| `Party_ID` / `Party_Size` | Groups one submission together — "party of 3, one no-show" |
+| `Party_Size` | Headcount on that submission — "party of 3, one no-show" |
 | `Form_Source` | Link to **that person's actual submission** |
 | `Program_Status` | Active · Waitlisted · Cancelled · Superseded |
 | `Lunch_Status` | Needed · No Lunch · Waitlisted · Cancelled · Superseded |
 | `Order_Ahead_Flag` | Highlighted when someone registered too late to order for |
 | `Admin_Notes` | Allergies/dietary needs, plus anything they typed |
+| `Party_ID` | Groups everyone from one submission together (last column — an internal ID, not something you usually need to read) |
 
 Only rows that are **`Active` *and* `Needed`** count toward the catering numbers.
+
+> `Lunch_Type` is resolved from **Lunch_Schedule** at the moment the row is
+> created and doesn't change afterward — the same "fact about when it
+> happened" rule as `Order_Ahead_Flag`. If someone registers before that
+> date's menu is set, `Lunch_Type` shows blank until they resubmit; `Lunch_Status`
+> still correctly reads `Needed` either way, so nobody is missed.
 
 **Superseded** means that person submitted the form again and this is the older
 version. It's kept on purpose so you can see the change happened — it's excluded
@@ -341,6 +351,13 @@ Check that location's **Lunch Service by Location** setting in Config. If it's
 That location is set to *Never* in Config. Change it to *Always* or
 *By exception* — note that forms already created keep their current shape, so
 you may need to let a new form be generated.
+
+**A `Never`-policy form still has a lunch question on it**
+New forms strip it automatically, and an existing form catches up the next
+time it gains a new date. To fix every existing form for a `Never` location
+right now, ask your developer to run `cleanupNeverPolicyForms()` from the
+Apps Script editor — it's a one-time cleanup, not a menu item, and it's safe
+to run more than once.
 
 **Nothing is syncing at all**
 Run **Check Triggers**. If that doesn't help, the script may need to be
