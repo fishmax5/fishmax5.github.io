@@ -50,9 +50,17 @@
  *      modified/cancelled timed event in our tracked window). This requires
  *      the "Calendar" Advanced Service to be enabled on this Apps Script
  *      project (Editor -> Services -> + Calendar API) — see SETUP below.
- *    - EVENT TITLE / DESCRIPTION GRAMMAR:
- *        "Yoga Basics [Cap: 12]"  -> capacity 12; brackets are for capacity
- *        "*Yoga Basics [Cap: 12]" -> TENTATIVE. A leading "*" means the
+ *    - EVENT GRAMMAR — the TITLE is just the program name; every SETTING
+ *      lives in the event DESCRIPTION, in brackets:
+ *        Title "Yoga Basics"           + description "[Cap: 12]"  -> capped at 12
+ *        Title "Yoga Basics"           + description "[Fixed]"    -> one continuous
+ *          series with ONE form, instead of a separate form per month
+ *        description "[Cap: 12, Fixed]" or "[Cap: 12] [Fixed]"    -> both
+ *      A title is what attendees read on a shared calendar, so scheduling
+ *      jargon does not belong there. Brackets left in a TITLE are still
+ *      honored as a legacy fallback (and logged) so existing calendars keep
+ *      their capacity; see parseSettingsBrackets()/resolveEventSettings().
+ *        Title "*Yoga Basics"          -> TENTATIVE. A leading "*" means the
  *          session isn't confirmed: no form is generated and no registry
  *          row is written, until the asterisk comes off. parseEventTitle()
  *          strips the asterisk from cleanTitle, and since computeEventId()
@@ -60,10 +68,13 @@
  *          SAME Event_ID — it just flows through as a new session with no
  *          reconciliation. (Re-adding an asterisk to an already-confirmed
  *          event does NOT triage it; existing registrations are kept.)
- *        Fixed-vs-Regular now comes from the event DESCRIPTION — put
- *          "[Fixed]" there. A legacy "[... Fixed]" in the title still works
- *          but logs a nudge; see isFixedSeries().
- *    - REGISTRATION LINKS ARE PREFILLED with every roster-grid box checked
+ *    - THE REGISTRATION LINK injected into each event description is an
+ *      HTML ANCHOR, not a raw URL, and carries no visible Form ID. The ID
+ *      rides in the href's #fragment — invisible to the reader, ignored by
+ *      Forms, still machine-recoverable so a lost form registry can be
+ *      rebuilt instead of spawning duplicate forms. See
+ *      buildRegistrationLinkLine()/findRegistrationLineInDescription().
+ *    - REGISTRATION LINKS ARE PREFILLED with every box checked
  *      (buildPrefilledAllCheckedUrl) so the common "all of us, all dates"
  *      case is read-and-submit and respondents just uncheck exceptions.
  *      Forms has no default-checked grid, so a prefilled response URL is
@@ -77,30 +88,31 @@
  *      sync covering only things needing a human — waitlisted registrants,
  *      forms that couldn't be opened, events sent to triage. A sync with
  *      nothing to report sends nothing. Blank address = disabled.
- *    - FIXED-SERIES FORMS now ask an "Attendance Mode" question up front:
- *      "Sign up for all dates" (one lunch choice per person, applied to
- *      every session automatically, including dates added to the series
- *      later) vs "Select individual dates" (the original per-date flow).
- *      Regular (month-bucketed) forms are unchanged and never show this
- *      question.
- *    - ROSTER GRIDS (both templates' per-date pages): the old "Select Dates
- *      Attending" checkbox + separate Attendee/Guest lunch-grid pair has
- *      been replaced by exactly two checkbox grids per guest-count branch —
- *      "Who is Attending Each Date?" and "Who Needs Lunch Each Date?" —
- *      with dates as ROWS and people (You / Guest 1 / Guest 2 / Guest 3,
- *      sliced to that branch's guest count) as COLUMNS. This gives full
- *      per-person, per-date resolution: any guest can attend/skip/eat
- *      independently of any other. A respondent who checks a lunch box for
- *      a date without checking that same date/person in the attendance
- *      grid is NOT silently dropped — processFormResponse() flags it in
- *      Admin_Notes and reconciles them as attending (see buildRegistrantRow
- *      call inside processFormResponse()). Grid COLUMNS are fixed at
- *      template-build time (see personColumnLabels()) and never touched
- *      again; only grid ROWS (the actual date labels) are refreshed as
- *      sessions/menu change.
- *    - Guest name fields are setRequired(true) so a chosen Guest Count can
- *      never silently outrun the names actually collected.
- *    - Both templates now call setCollectEmail(true) and
+ *    - ONE FORM TEMPLATE, ONE BRANCH POINT. Every group — Fixed or Regular
+ *      — is built from the same template, and "Attendance Mode" is now on
+ *      every form:
+ *        "Everyone, every date"          -> one checkbox of who eats, applied
+ *          to every session date, including dates added to a Fixed series
+ *          afterward (see the ALL_DATES registry + applyAllDatesCatchup()).
+ *        "Let me pick specific dates/people" -> the two roster grids,
+ *          "Who is Attending Each Date?" and "Who Needs Lunch Each Date?",
+ *          with dates as ROWS and PERSON_COLUMN_LABELS as COLUMNS. Full
+ *          per-person, per-date resolution: any guest can attend/skip/eat
+ *          independently of any other. Checking lunch WITHOUT attendance is
+ *          not silently dropped — processFormResponse() reconciles it as
+ *          attending and flags it in Admin_Notes.
+ *      There is NO "how many guests?" question: page 1 has three optional
+ *      guest-name fields and the headcount is simply how many were filled
+ *      in. That kills two bugs by construction — the old "said 3, named 2,
+ *      catered for 2" mismatch, and mis-routing between guest-count branch
+ *      pages (Forms silently falls through to the NEXT section when an
+ *      explicit after-section jump isn't applied, which is how picking 2
+ *      guests could land you on the 3-guest page). The whole form now has
+ *      exactly two page breaks and two navigation rules, both to SUBMIT.
+ *      A grid column whose guest name was left blank is ignored at parse
+ *      time, so the pre-checked columns for guests you didn't bring cost
+ *      nothing.
+ *    - The template calls setCollectEmail(true) and
  *      setAllowResponseEdits(true) — a submitter's email becomes a real
  *      identity key, Google auto-sends a receipt with an edit link, and
  *      Form_Source on Lunch_and_Event_Registrants links straight to that
@@ -429,65 +441,75 @@ function getOrCreateFormsFolder() {
  * are abandoned and rebuilt fresh instead of silently drifting out of sync
  * with what processFormResponse() expects to find.
  */
-const TEMPLATE_VERSION = 2;
+const TEMPLATE_VERSION = 3;
 const TEMPLATE_FORM_PROP_KEY = `TEMPLATE_FORM_ID_V${TEMPLATE_VERSION}`;
-/** Separate cached template for Fixed-series groups (adds the Attendance Mode / All-Dates-Lunch pages). */
-const TEMPLATE_FIXED_FORM_PROP_KEY = `TEMPLATE_FIXED_FORM_ID_V${TEMPLATE_VERSION}`;
 
 /** Stable marker titles used to find-and-customize specific items after copying a template. */
 const TEMPLATE_ITEM_TITLES = {
   NAME: 'Name',
-  GUEST_COUNT: 'Guest Count',
-  // Roster grids: rows = dates, columns = people (see personColumnLabels()).
+  // Roster grids: rows = dates, columns = PERSON_COLUMN_LABELS.
   ATTENDANCE_GRID: 'Who is Attending Each Date?',
   LUNCH_GRID: 'Who Needs Lunch Each Date?',
   ALLERGIES: 'Allergies / Dietary Needs',
   ADDITIONAL_NOTES: 'Anything Else?',
   FOOTER: 'Footer Note',
   ATTENDANCE_MODE: 'Attendance Mode',
-  ALL_DATES_ATTENDEE_LUNCH: 'Your Lunch Choice (All Dates)'
+  ALL_DATES_LUNCH_PEOPLE: 'Who Needs Lunch? (Applies to Every Date)'
 };
 
-/** The two choices on a Fixed-series form's Attendance Mode question. */
+/** The two choices on the Attendance Mode question — now on EVERY form, not just Fixed series. */
 const ATTENDANCE_MODE_CHOICES = {
-  ALL_DATES: 'Sign up for all dates',
-  INDIVIDUAL: 'Select individual dates'
+  ALL_DATES: 'Everyone, every date',
+  INDIVIDUAL: 'Let me pick specific dates/people'
 };
-
-/** Title used for guest N's "applies to every date" lunch question on the All-Dates-Lunch page. */
-function allDatesGuestLunchTitle(guestNumber) {
-  return `Guest ${guestNumber} Lunch Choice (All Dates)`;
-}
 
 /**
- * Column labels for the two roster grids (ATTENDANCE_GRID / LUNCH_GRID),
- * for a given branch's guest count (0-3). Fixed at template-build time —
- * unlike grid ROWS (the actual dates), these never change after creation.
+ * Grid columns and all-dates lunch choices. FIXED at four entries on every
+ * form, deliberately: the guest-count question and its four branch pages
+ * are gone (see getOrCreateTemplateForm()), so there is nothing left to
+ * vary the column list by. A column whose matching guest name was left
+ * blank is simply ignored at parse time.
  */
-function personColumnLabels(guestCount) {
-  const labels = ['You'];
-  for (let g = 1; g <= guestCount; g++) labels.push(`Guest ${g}`);
-  return labels;
-}
+const PERSON_COLUMN_LABELS = ['You', 'Guest 1', 'Guest 2', 'Guest 3'];
+
+/** Max guests one submission can bring — the number of optional name fields on page 1. */
+const MAX_GUESTS = PERSON_COLUMN_LABELS.length - 1;
 
 /** Placeholder row used on a freshly-built template's grids, before the first real date list is set. */
 const TEMPLATE_GRID_PLACEHOLDER_ROW = '(dates will be filled in automatically)';
 
 /**
- * Returns the REGULAR (month-bucketed) template form, building it once and
- * reusing it forever after. Fixed-series groups use getOrCreateFixedTemplateForm()
- * instead (see section 4b) — it has the same guest-detail branching, plus
- * an extra "Attendance Mode" question per guest-count variant.
+ * Returns THE template form — one template for every group, Fixed or not.
+ * Built once and reused forever after (keyed by TEMPLATE_VERSION).
  *
- * The template's page flow:
- *   Page 1: Name, Guest Count (0/1/2/3, each branching below)
- *   "1/2/3 Guest Details" pages: exactly N required guest-name fields,
- *     continuing on to that guest-count's own "Lunch Selection (N Guests)" page
- *   "Lunch Selection (N Guests)" (one per guest count, 0-3): the roster —
- *     an ATTENDANCE_GRID and a LUNCH_GRID, both with dates as rows and
- *     ['You', 'Guest 1', ...] as columns (see personColumnLabels()) — plus
- *     Allergies/Dietary, the per-location Footer note, and an Anything Else
- *     catch-all.
+ * Page flow — deliberately only ONE branch point in the whole form:
+ *
+ *   Page 1   Name (required)
+ *            Guest 1/2/3 Name (all optional — headcount is simply how many
+ *              you fill in; there is no "how many guests?" question)
+ *            Attendance Mode (required), which branches to exactly one of:
+ *
+ *   "Everyone, Every Date"   ALL_DATES_LUNCH_PEOPLE checkbox (who eats, applied
+ *                            to every session date, including dates added to a
+ *                            Fixed series later) -> SUBMIT
+ *
+ *   "Specific Dates"         ATTENDANCE_GRID + LUNCH_GRID roster grids, dates as
+ *                            rows and PERSON_COLUMN_LABELS as columns -> SUBMIT
+ *
+ * Both branch pages also carry Allergies, the per-location Footer note, and
+ * an "Anything Else?" catch-all.
+ *
+ * WHY IT IS SHAPED LIKE THIS: the previous template asked "Guest Count"
+ * (0/1/2/3) and branched to a guest-detail page per count and then a roster
+ * page per count — eight sections, each depending on Google Forms honoring
+ * an explicit "after this section, go to..." jump. When such a jump is not
+ * applied, Forms silently falls through to the NEXT section in document
+ * order, which is how picking 2 guests could land you on the 3-guest page.
+ * Dropping the guest-count question removes seven of the eight jumps and
+ * makes that entire class of mis-routing impossible rather than merely
+ * fixed. It also removes the old "picked 3 guests, typed 2 names, catered
+ * for 2" mismatch, since the names ARE the headcount.
+ *
  * IMPORTANT ordering note: in Apps Script Forms, a page's contents are
  * whatever items were added between ITS PageBreakItem and the NEXT one —
  * order of addition, not order of variable creation, decides this.
@@ -507,170 +529,47 @@ function getOrCreateTemplateForm() {
   form.setCollectEmail(true);
   form.setAllowResponseEdits(true);
 
+  // --- Page 1: who is registering -------------------------------------
   form.addTextItem().setTitle(TEMPLATE_ITEM_TITLES.NAME).setRequired(true);
-  const guestCountItem = form.addListItem().setTitle(TEMPLATE_ITEM_TITLES.GUEST_COUNT).setRequired(true);
+  for (let g = 1; g <= MAX_GUESTS; g++) {
+    form.addTextItem()
+      .setTitle(`Guest ${g} Name`)
+      .setHelpText(g === 1 ? 'Leave blank if you are not bringing anyone.' : '')
+      .setRequired(false);
+  }
+  const modeItem = form.addListItem().setTitle(TEMPLATE_ITEM_TITLES.ATTENDANCE_MODE)
+    .setHelpText('Most people want the first option.')
+    .setRequired(true);
 
-  const guest1Page = form.addPageBreakItem().setTitle('1 Guest Details');
-  form.addTextItem().setTitle('Guest 1 Name').setRequired(true);
+  // --- Branch A: everyone, every date ----------------------------------
+  const allDatesPage = form.addPageBreakItem().setTitle('Everyone, Every Date');
+  form.addCheckboxItem().setTitle(TEMPLATE_ITEM_TITLES.ALL_DATES_LUNCH_PEOPLE)
+    .setChoiceValues(PERSON_COLUMN_LABELS)
+    .setHelpText('Uncheck anyone who will not be eating. Ignore rows for guests you did not name.');
+  form.addTextItem().setTitle(TEMPLATE_ITEM_TITLES.ALLERGIES);
+  form.addSectionHeaderItem().setTitle(TEMPLATE_ITEM_TITLES.FOOTER);
+  form.addParagraphTextItem().setTitle(TEMPLATE_ITEM_TITLES.ADDITIONAL_NOTES);
+  allDatesPage.setGoToPage(FormApp.PageNavigationType.SUBMIT);
 
-  const guest2Page = form.addPageBreakItem().setTitle('2 Guest Details');
-  form.addTextItem().setTitle('Guest 1 Name').setRequired(true);
-  form.addTextItem().setTitle('Guest 2 Name').setRequired(true);
+  // --- Branch B: per-date roster ---------------------------------------
+  const specificPage = form.addPageBreakItem().setTitle('Specific Dates');
+  form.addCheckboxGridItem().setTitle(TEMPLATE_ITEM_TITLES.ATTENDANCE_GRID)
+    .setRows([TEMPLATE_GRID_PLACEHOLDER_ROW]).setColumns(PERSON_COLUMN_LABELS);
+  form.addCheckboxGridItem().setTitle(TEMPLATE_ITEM_TITLES.LUNCH_GRID)
+    .setRows([TEMPLATE_GRID_PLACEHOLDER_ROW]).setColumns(PERSON_COLUMN_LABELS);
+  form.addTextItem().setTitle(TEMPLATE_ITEM_TITLES.ALLERGIES);
+  form.addSectionHeaderItem().setTitle(TEMPLATE_ITEM_TITLES.FOOTER);
+  form.addParagraphTextItem().setTitle(TEMPLATE_ITEM_TITLES.ADDITIONAL_NOTES);
+  specificPage.setGoToPage(FormApp.PageNavigationType.SUBMIT);
 
-  const guest3Page = form.addPageBreakItem().setTitle('3 Guest Details');
-  form.addTextItem().setTitle('Guest 1 Name').setRequired(true);
-  form.addTextItem().setTitle('Guest 2 Name').setRequired(true);
-  form.addTextItem().setTitle('Guest 3 Name').setRequired(true);
-
-  // One roster page per guest-count variant (0-3): the grid COLUMNS are
-  // branch-specific and fixed here permanently; only grid ROWS (the real
-  // session dates) get refreshed later, by title, across every branch at once.
-  const lunchPageByCount = {};
-  [0, 1, 2, 3].forEach(n => {
-    const guestNoun = n === 1 ? 'Guest' : 'Guests';
-    const page = form.addPageBreakItem().setTitle(`Lunch Selection (${n} ${guestNoun})`);
-    const columns = personColumnLabels(n);
-    form.addCheckboxGridItem().setTitle(TEMPLATE_ITEM_TITLES.ATTENDANCE_GRID)
-      .setRows([TEMPLATE_GRID_PLACEHOLDER_ROW]).setColumns(columns);
-    form.addCheckboxGridItem().setTitle(TEMPLATE_ITEM_TITLES.LUNCH_GRID)
-      .setRows([TEMPLATE_GRID_PLACEHOLDER_ROW]).setColumns(columns);
-    form.addTextItem().setTitle(TEMPLATE_ITEM_TITLES.ALLERGIES);
-    form.addSectionHeaderItem().setTitle(TEMPLATE_ITEM_TITLES.FOOTER);
-    form.addParagraphTextItem().setTitle(TEMPLATE_ITEM_TITLES.ADDITIONAL_NOTES);
-    page.setGoToPage(FormApp.PageNavigationType.SUBMIT);
-    lunchPageByCount[n] = page;
-  });
-
-  guestCountItem.setChoices([
-    guestCountItem.createChoice('0', lunchPageByCount[0]),
-    guestCountItem.createChoice('1', guest1Page),
-    guestCountItem.createChoice('2', guest2Page),
-    guestCountItem.createChoice('3', guest3Page)
+  // The form's ONLY navigation decision.
+  modeItem.setChoices([
+    modeItem.createChoice(ATTENDANCE_MODE_CHOICES.ALL_DATES, allDatesPage),
+    modeItem.createChoice(ATTENDANCE_MODE_CHOICES.INDIVIDUAL, specificPage)
   ]);
-  guest1Page.setGoToPage(lunchPageByCount[1]);
-  guest2Page.setGoToPage(lunchPageByCount[2]);
-  guest3Page.setGoToPage(lunchPageByCount[3]);
 
   props.setProperty(TEMPLATE_FORM_PROP_KEY, form.getId());
   log(`Created template registration form: ${form.getId()}`);
-  return form;
-}
-
-/**
- * Returns the FIXED-SERIES template form (cached the same way as the
- * regular template). On top of the regular template's Name/Guest-Count/
- * guest-detail-page structure, every guest-count branch (0/1/2/3) first
- * hits an "Attendance Mode" question:
- *   - "Sign up for all dates"      -> a guest-count-specific All-Dates-Lunch
- *                                     page (one lunch pick per person,
- *                                     applied to every session date)
- *   - "Select individual dates"    -> that same guest-count's roster page
- *                                     (ATTENDANCE_GRID + LUNCH_GRID — see
- *                                     getOrCreateTemplateForm()'s doc comment)
- * This is what lets a Fixed-series responder register for the whole run in
- * one pass instead of checking every date box individually.
- */
-function getOrCreateFixedTemplateForm() {
-  const props = PropertiesService.getScriptProperties();
-  const existingId = props.getProperty(TEMPLATE_FIXED_FORM_PROP_KEY);
-  if (existingId) {
-    try {
-      return FormApp.openById(existingId);
-    } catch (err) {
-      log(`⚠️ Stored Fixed-series template form ${existingId} could not be opened (${err}) — building a fresh one.`);
-    }
-  }
-
-  const form = FormApp.create('TEMPLATE — Fixed-Series Registration Base (do not edit or delete)');
-  form.setCollectEmail(true);
-  form.setAllowResponseEdits(true);
-
-  form.addTextItem().setTitle(TEMPLATE_ITEM_TITLES.NAME).setRequired(true);
-  const guestCountItem = form.addListItem().setTitle(TEMPLATE_ITEM_TITLES.GUEST_COUNT).setRequired(true);
-
-  const guest1Page = form.addPageBreakItem().setTitle('1 Guest Details');
-  form.addTextItem().setTitle('Guest 1 Name').setRequired(true);
-  const guest2Page = form.addPageBreakItem().setTitle('2 Guest Details');
-  form.addTextItem().setTitle('Guest 1 Name').setRequired(true);
-  form.addTextItem().setTitle('Guest 2 Name').setRequired(true);
-  const guest3Page = form.addPageBreakItem().setTitle('3 Guest Details');
-  form.addTextItem().setTitle('Guest 1 Name').setRequired(true);
-  form.addTextItem().setTitle('Guest 2 Name').setRequired(true);
-  form.addTextItem().setTitle('Guest 3 Name').setRequired(true);
-
-  // One Attendance Mode page + one All-Dates-Lunch page per guest-count
-  // variant (0/1/2/3) — each variant's All-Dates-Lunch page asks exactly as
-  // many "applies to every date" lunch questions as that variant has people.
-  const attendanceModePages = {};
-  const allDatesLunchPages = {};
-  [0, 1, 2, 3].forEach(n => {
-    const guestNoun = n === 1 ? 'Guest' : 'Guests';
-    form.addPageBreakItem().setTitle(`Attendance Mode (${n} ${guestNoun})`);
-    const modeItem = form.addListItem().setTitle(TEMPLATE_ITEM_TITLES.ATTENDANCE_MODE).setRequired(true);
-    attendanceModePages[n] = modeItem;
-
-    const lunchPage = form.addPageBreakItem().setTitle(`All-Dates Lunch (${n} ${guestNoun})`);
-    form.addListItem().setTitle(TEMPLATE_ITEM_TITLES.ALL_DATES_ATTENDEE_LUNCH)
-      .setChoiceValues(GENERIC_LUNCH_CHOICES).setRequired(true);
-    for (let g = 1; g <= n; g++) {
-      form.addListItem().setTitle(allDatesGuestLunchTitle(g)).setChoiceValues(GENERIC_LUNCH_CHOICES).setRequired(true);
-    }
-    form.addTextItem().setTitle(TEMPLATE_ITEM_TITLES.ALLERGIES);
-    form.addSectionHeaderItem().setTitle(TEMPLATE_ITEM_TITLES.FOOTER);
-    form.addParagraphTextItem().setTitle(TEMPLATE_ITEM_TITLES.ADDITIONAL_NOTES);
-    lunchPage.setGoToPage(FormApp.PageNavigationType.SUBMIT);
-    allDatesLunchPages[n] = lunchPage;
-  });
-
-  // Per-date roster pages — one per guest-count variant, identical in spirit
-  // to getOrCreateTemplateForm()'s — used whenever the responder picks
-  // "individual dates".
-  const individualPages = {};
-  [0, 1, 2, 3].forEach(n => {
-    const guestNoun = n === 1 ? 'Guest' : 'Guests';
-    const page = form.addPageBreakItem().setTitle(`Individual Dates (${n} ${guestNoun})`);
-    const columns = personColumnLabels(n);
-    form.addCheckboxGridItem().setTitle(TEMPLATE_ITEM_TITLES.ATTENDANCE_GRID)
-      .setRows([TEMPLATE_GRID_PLACEHOLDER_ROW]).setColumns(columns);
-    form.addCheckboxGridItem().setTitle(TEMPLATE_ITEM_TITLES.LUNCH_GRID)
-      .setRows([TEMPLATE_GRID_PLACEHOLDER_ROW]).setColumns(columns);
-    form.addTextItem().setTitle(TEMPLATE_ITEM_TITLES.ALLERGIES);
-    form.addSectionHeaderItem().setTitle(TEMPLATE_ITEM_TITLES.FOOTER);
-    form.addParagraphTextItem().setTitle(TEMPLATE_ITEM_TITLES.ADDITIONAL_NOTES);
-    page.setGoToPage(FormApp.PageNavigationType.SUBMIT);
-    individualPages[n] = page;
-  });
-
-  // Wire up the Attendance Mode branching for each guest-count variant.
-  [0, 1, 2, 3].forEach(n => {
-    attendanceModePages[n].setChoices([
-      attendanceModePages[n].createChoice(ATTENDANCE_MODE_CHOICES.ALL_DATES, allDatesLunchPages[n]),
-      attendanceModePages[n].createChoice(ATTENDANCE_MODE_CHOICES.INDIVIDUAL, individualPages[n])
-    ]);
-  });
-
-  // Wire up Guest Count -> guest-detail pages (or straight to the 0-guest
-  // Attendance Mode page) -> each guest-detail page's own Attendance Mode page.
-  const attendanceModePageBreaks = form.getItems(FormApp.ItemType.PAGE_BREAK)
-    .filter(it => /^Attendance Mode \(/.test(it.getTitle()));
-  const modePageByCount = {};
-  attendanceModePageBreaks.forEach(pb => {
-    const match = /^Attendance Mode \((\d)/.exec(pb.getTitle());
-    if (match) modePageByCount[Number(match[1])] = pb.asPageBreakItem();
-  });
-
-  guestCountItem.setChoices([
-    guestCountItem.createChoice('0', modePageByCount[0]),
-    guestCountItem.createChoice('1', guest1Page),
-    guestCountItem.createChoice('2', guest2Page),
-    guestCountItem.createChoice('3', guest3Page)
-  ]);
-  guest1Page.setGoToPage(modePageByCount[1]);
-  guest2Page.setGoToPage(modePageByCount[2]);
-  guest3Page.setGoToPage(modePageByCount[3]);
-
-  props.setProperty(TEMPLATE_FIXED_FORM_PROP_KEY, form.getId());
-  log(`Created Fixed-series template registration form: ${form.getId()}`);
   return form;
 }
 
@@ -1462,18 +1361,28 @@ function buildPrefilledAllCheckedUrl(form) {
 
     form.getItems().forEach(item => {
       const title = item.getTitle();
-      if (title !== TEMPLATE_ITEM_TITLES.ATTENDANCE_GRID && title !== TEMPLATE_ITEM_TITLES.LUNCH_GRID) return;
-      const grid = item.asCheckboxGridItem();
-      const rows = grid.getRows();
-      const columns = grid.getColumns();
-      if (rows.length === 0 || columns.length === 0) return;
-      // One entry per row: the full column list = every person checked.
-      const allChecked = rows.map(() => columns.slice());
+      const isGrid = title === TEMPLATE_ITEM_TITLES.ATTENDANCE_GRID || title === TEMPLATE_ITEM_TITLES.LUNCH_GRID;
+      const isPeopleCheckbox = title === TEMPLATE_ITEM_TITLES.ALL_DATES_LUNCH_PEOPLE;
+      if (!isGrid && !isPeopleCheckbox) return;
+
       try {
-        response = response.withItemResponse(grid.createResponse(allChecked));
+        if (isGrid) {
+          const grid = item.asCheckboxGridItem();
+          const rows = grid.getRows();
+          const columns = grid.getColumns();
+          if (rows.length === 0 || columns.length === 0) return;
+          // One entry per row: the full column list = every person checked.
+          response = response.withItemResponse(grid.createResponse(rows.map(() => columns.slice())));
+        } else {
+          // The "everyone, every date" branch's single who-eats checkbox.
+          const checkbox = item.asCheckboxItem();
+          const choices = checkbox.getChoices().map(c => c.getValue());
+          if (choices.length === 0) return;
+          response = response.withItemResponse(checkbox.createResponse(choices));
+        }
         anyPrefilled = true;
       } catch (err) {
-        // A grid still holding a placeholder row, or otherwise not
+        // An item still holding a placeholder row, or otherwise not
         // answerable — skip it rather than losing the whole URL.
         log(`ℹ️ Skipped prefill for "${title}" on form ${form.getId()}: ${err}`);
       }
@@ -1582,12 +1491,7 @@ function initSheet() {
   try {
     getOrCreateTemplateForm();
   } catch (err) {
-    log(`⚠️ Could not build/verify the regular template registration form during setup (${err}) — it will be retried on the next calendar sync.`);
-  }
-  try {
-    getOrCreateFixedTemplateForm();
-  } catch (err) {
-    log(`⚠️ Could not build/verify the Fixed-series template registration form during setup (${err}) — it will be retried on the next calendar sync.`);
+    log(`⚠️ Could not build/verify the template registration form during setup (${err}) — it will be retried on the next calendar sync.`);
   }
 
   renderRegistrantsSheet(true);
@@ -2422,28 +2326,50 @@ function computeSyncDateRange() {
   return { start, end };
 }
 
-/**
- * Marker that flags an event as a Fixed series. Lives in the event
- * DESCRIPTION now, not the title — a title is what attendees read on a
- * shared calendar, and "[Fixed]" there is internal scheduling jargon.
- * Matched case-insensitively anywhere in the description, so it coexists
- * fine with the "Registration Link: ..." line we inject.
- */
-const FIXED_SERIES_DESCRIPTION_MARKER = /\[\s*Fixed\s*\]/i;
-
 /** A leading "*" on the title marks an event TENTATIVE — see parseEventTitle(). */
 const TENTATIVE_TITLE_PREFIX = '*';
 
+/** Every bracketed group in a string: "[Cap: 12] [Fixed]" and "[Cap: 12, Fixed]" both work. */
+const BRACKET_GROUP_REGEX = /\[([^\]]*)\]/g;
+
 /**
- * Parses event titles. Recognized shapes:
- *   "Yoga Basics [Cap: 12]"   -> capped
- *   "Chess Night"             -> UNCAPPED (no brackets)
- *   "*Yoga Basics [Cap: 12]"  -> capped, but TENTATIVE (see below)
+ * Pulls the settings this system understands out of any bracketed groups
+ * in a blob of text:
+ *   [Cap: 12]          -> capacity 12
+ *   [Fixed]            -> one continuous series rather than month buckets
+ *   [Cap: 12, Fixed]   -> both, one bracket
+ * Unrecognized bracket contents are ignored, so people can bracket other
+ * notes in a description without confusing anything.
+ */
+function parseSettingsBrackets(text) {
+  const raw = String(text || '');
+  let capacity = 0;
+  let isFixed = false;
+  let sawAny = false;
+
+  BRACKET_GROUP_REGEX.lastIndex = 0; // the /g regex is module-level; never trust its cursor
+  let match;
+  while ((match = BRACKET_GROUP_REGEX.exec(raw)) !== null) {
+    const content = match[1] || '';
+    const capMatch = /Cap:\s*(\d+)/i.exec(content);
+    if (capMatch) { capacity = parseInt(capMatch[1], 10); sawAny = true; }
+    if (/\bFixed\b/i.test(content)) { isFixed = true; sawAny = true; }
+  }
+  return { capacity, isFixed, sawAny };
+}
+
+/**
+ * Parses event titles. The title is now just the program name, optionally
+ * prefixed with "*":
+ *   "Yoga Basics"    -> a program
+ *   "*Yoga Basics"   -> the same program, TENTATIVE (see below)
  *
- * Fixed-vs-Regular is NO LONGER read from the title — it comes from the
- * event description via isFixedFromDescription(). A legacy "[... Fixed]"
- * in the title is still honored (and logged) so existing calendars keep
- * working, but the description is the supported home for it.
+ * BOTH capacity and Fixed-vs-Regular now live in the event DESCRIPTION —
+ * see parseSettingsBrackets() / resolveEventSettings(). The title is what
+ * attendees read on a shared calendar, and "[Cap: 12, Fixed]" there is
+ * internal scheduling jargon. Brackets left in a title are still read as a
+ * legacy fallback (and logged) so existing calendars don't silently lose
+ * their capacity, but they're stripped from cleanTitle either way.
  *
  * A title beginning with "*" marks the event TENTATIVE: it is skipped
  * entirely by the form/registry pipeline until the asterisk is removed
@@ -2463,35 +2389,40 @@ function parseEventTitle(title) {
   }
   if (!raw) return null;
 
-  const match = /^(.*?)\s*(?:\[\s*(.*?)\s*\])?\s*$/.exec(raw);
-  const cleanTitle = (match[1] || '').trim();
+  const legacy = parseSettingsBrackets(raw);
+  // Strip every bracketed group, wherever it sits, so the clean title is
+  // stable no matter how someone spaced things out.
+  const cleanTitle = raw.replace(BRACKET_GROUP_REGEX, ' ').replace(/\s+/g, ' ').trim();
   if (!cleanTitle) return null;
 
-  const bracketContent = match[2] || '';
-  const capMatch = /Cap:\s*(\d+)/i.exec(bracketContent);
-  const capacity = capMatch ? parseInt(capMatch[1], 10) : 0;
-  const legacyFixedInTitle = /\bFixed\b/i.test(bracketContent);
-
-  return { cleanTitle, capacity, isTentative, legacyFixedInTitle };
+  return {
+    cleanTitle,
+    isTentative,
+    legacyCapacity: legacy.capacity,
+    legacyIsFixed: legacy.isFixed,
+    hasLegacyBrackets: legacy.sawAny
+  };
 }
 
 /**
- * Decides whether a calendar event is a Fixed series, reading the
- * description marker first and falling back to the deprecated title
- * bracket. Takes the already-parsed title so the legacy check is free.
+ * Resolves { capacity, isFixed } for one event: the DESCRIPTION's brackets
+ * win, and anything the description doesn't specify falls back to legacy
+ * brackets left in the title (with a one-time nudge in the log).
  */
-function isFixedSeries(event, parsedTitle) {
+function resolveEventSettings(event, parsedTitle) {
   const description = (event && typeof event.getDescription === 'function')
     ? (event.getDescription() || '')
     : '';
-  if (FIXED_SERIES_DESCRIPTION_MARKER.test(description)) return true;
+  const fromDescription = parseSettingsBrackets(description);
 
-  if (parsedTitle && parsedTitle.legacyFixedInTitle) {
-    log(`ℹ️ "${parsedTitle.cleanTitle}" still marks itself Fixed in its TITLE. That still works, but the supported ` +
-      `place is the event description — add "[Fixed]" there and drop it from the title.`);
-    return true;
+  const capacity = fromDescription.capacity || parsedTitle.legacyCapacity || 0;
+  const isFixed = fromDescription.isFixed || parsedTitle.legacyIsFixed || false;
+
+  if (parsedTitle.hasLegacyBrackets && !fromDescription.sawAny) {
+    log(`ℹ️ "${parsedTitle.cleanTitle}" still carries its settings in the TITLE. That still works, but the supported ` +
+      `place is now the event DESCRIPTION — move "[Cap: N]" / "[Fixed]" there and drop them from the title.`);
   }
-  return false;
+  return { capacity, isFixed };
 }
 
 /** Public entry point: acquires a script lock so overlapping executions can't race each other. */
@@ -2546,7 +2477,9 @@ function syncCalendarsInternal() {
             tentativeTitles.add(parsed.cleanTitle);
             return null;
           }
-          parsed.isFixed = isFixedSeries(ev, parsed);
+          const settings = resolveEventSettings(ev, parsed);
+          parsed.capacity = settings.capacity;
+          parsed.isFixed = settings.isFixed;
           return { ev, parsed };
         })
         .filter(Boolean);
@@ -2687,19 +2620,56 @@ function getExistingRegistryState(registrySheet) {
   return state;
 }
 
-const REGISTRATION_LINK_LINE_REGEX = /^.*Registration Link:\s*(\S+)\s*\[Form ID:\s*([a-zA-Z0-9_-]+)\]\s*$/m;
+/**
+ * The registration line we inject into a calendar event description.
+ *
+ * It's an HTML anchor — Google Calendar renders a subset of HTML in
+ * descriptions — so attendees see a short "Register for X" link instead of
+ * a raw URL. That matters more than it used to: the URL is now a PREFILLED
+ * form link (see buildPrefilledAllCheckedUrl) carrying an entry parameter
+ * per date per person, which is far too long to read as bare text.
+ *
+ * The form ID rides along in the href's #fragment rather than as a visible
+ * "[Form ID: ...]" tag. A fragment is never sent to the server and is
+ * ignored by Forms, so it changes nothing for the person clicking it — but
+ * it keeps the ID machine-recoverable, which is what lets
+ * findExistingFormIdFromEvents() rebuild a lost form registry instead of
+ * spawning duplicate forms.
+ */
+const REGISTRATION_LINK_FRAGMENT_KEY = 'form';
+
+function buildRegistrationLinkLine(group, formInfo) {
+  const label = group.isFixed
+    ? `📝 Register for ${group.cleanTitle}`
+    : `📝 Register for ${group.cleanTitle} — ${group.monthLabel}`;
+  const href = `${formInfo.publishedUrl}#${REGISTRATION_LINK_FRAGMENT_KEY}=${formInfo.formId}`;
+  return `<a href="${href}">${label}</a>`;
+}
+
+/** Matches our anchor, capturing (1) the URL without fragment and (2) the form ID. */
+const REGISTRATION_ANCHOR_REGEX =
+  new RegExp(`<a href="([^"#]*)#${REGISTRATION_LINK_FRAGMENT_KEY}=([a-zA-Z0-9_-]+)"[^>]*>.*?</a>`, 'i');
+/** Pre-anchor format, still read so events stamped by older versions keep working. */
+const LEGACY_REGISTRATION_LINE_REGEX = /^.*Registration Link:\s*(\S+)\s*\[Form ID:\s*([a-zA-Z0-9_-]+)\]\s*$/m;
+
+/** Finds our registration line in a description in either format. Returns { url, formId, matchText } or null. */
+function findRegistrationLineInDescription(description) {
+  const anchor = REGISTRATION_ANCHOR_REGEX.exec(description);
+  if (anchor) return { url: anchor[1], formId: anchor[2], matchText: anchor[0], isLegacy: false };
+  const legacy = LEGACY_REGISTRATION_LINE_REGEX.exec(description);
+  if (legacy) return { url: legacy[1], formId: legacy[2], matchText: legacy[0], isLegacy: true };
+  return null;
+}
 
 function findExistingFormIdFromEvents(events) {
   for (const ev of events) {
-    const desc = ev.getDescription() || '';
-    const match = REGISTRATION_LINK_LINE_REGEX.exec(desc);
-    if (!match) continue;
-    const candidateFormId = match[2];
+    const found = findRegistrationLineInDescription(ev.getDescription() || '');
+    if (!found) continue;
     try {
-      FormApp.openById(candidateFormId);
-      return candidateFormId;
+      FormApp.openById(found.formId);
+      return found.formId;
     } catch (err) {
-      log(`⚠️ Found a Form ID marker (${candidateFormId}) in an event description, but it could not be opened (${err}) — ignoring.`);
+      log(`⚠️ Found a Form ID marker (${found.formId}) in an event description, but it could not be opened (${err}) — ignoring.`);
     }
   }
   return null;
@@ -2742,7 +2712,9 @@ function createRegistrationForm(group, locationName, configInfo) {
     ? `${group.cleanTitle} — Registration`
     : `${group.cleanTitle} - ${group.monthLabel}`;
 
-  const templateForm = group.isFixed ? getOrCreateFixedTemplateForm() : getOrCreateTemplateForm();
+  // One template for everything now — the Attendance Mode fast path is on
+  // every form, so Fixed and Regular groups no longer need separate bases.
+  const templateForm = getOrCreateTemplateForm();
   const copiedFile = DriveApp.getFileById(templateForm.getId()).makeCopy(formTitle, getOrCreateFormsFolder());
   const form = FormApp.openById(copiedFile.getId());
   form.setTitle(formTitle);
@@ -2863,17 +2835,17 @@ function moveRegistrantsToTriage(registrantsSheet, deletedEventInfo) {
 }
 
 function backInjectCalendarDescriptions(group, formInfo) {
-  const linkLine = group.isFixed
-    ? `Registration Link: ${formInfo.publishedUrl} [Form ID: ${formInfo.formId}]`
-    : `${group.monthLabel} Registration Link: ${formInfo.publishedUrl} [Form ID: ${formInfo.formId}]`;
+  const linkLine = buildRegistrationLinkLine(group, formInfo);
 
   group.events.forEach(ev => {
     const existing = ev.getDescription() || '';
-    const match = REGISTRATION_LINK_LINE_REGEX.exec(existing);
+    const found = findRegistrationLineInDescription(existing);
 
-    if (match) {
-      if (match[1] === formInfo.publishedUrl && match[2] === formInfo.formId) return;
-      const corrected = existing.replace(REGISTRATION_LINK_LINE_REGEX, linkLine);
+    if (found) {
+      // Already current, in the current format — leave the event alone
+      // rather than burning a write (and a notification) on every sync.
+      if (!found.isLegacy && found.url === formInfo.publishedUrl && found.formId === formInfo.formId) return;
+      const corrected = existing.replace(found.matchText, linkLine);
       if (corrected !== existing) ev.setDescription(corrected);
       return;
     }
@@ -3113,46 +3085,60 @@ function getAdminNotesResponse(formIndex, response) {
   return parts.join(' | ');
 }
 
+/**
+ * Resolves the people on one submission from the name fields alone. There
+ * is no guest-count question any more: the headcount IS how many guest
+ * name fields were filled in, which makes the old "said 3, named 2,
+ * catered for 2" mismatch structurally impossible.
+ *
+ * Returned in PERSON_COLUMN_LABELS order, and a guest whose name was left
+ * blank produces NO entry — so a stray check in that guest's grid column
+ * (they're all pre-checked) is correctly ignored rather than inventing a
+ * nameless person.
+ */
+function resolvePeopleOnResponse(formIndex, response, registrantName, adminNotes) {
+  const people = [{
+    name: registrantName, personType: 'Attendee', primaryRegistrant: 'Self',
+    columnLabel: PERSON_COLUMN_LABELS[0], baseNotes: adminNotes
+  }];
+  for (let g = 1; g <= MAX_GUESTS; g++) {
+    const guestName = String(getResponseValueByTitle(formIndex, response, `Guest ${g} Name`) || '').trim();
+    if (!guestName) continue;
+    people.push({
+      name: guestName, personType: 'Guest', primaryRegistrant: registrantName,
+      columnLabel: PERSON_COLUMN_LABELS[g], baseNotes: ''
+    });
+  }
+  return people;
+}
+
 function processFormResponse(formIndex, response, registryIndex, protectedKeys, existingRowIndex, orderAheadDays) {
   const form = formIndex.form;
-  const name = getResponseValueByTitle(formIndex, response, TEMPLATE_ITEM_TITLES.NAME) || 'Unknown';
-  const guestCount = parseInt(getResponseValueByTitle(formIndex, response, TEMPLATE_ITEM_TITLES.GUEST_COUNT) || '0', 10);
-  const guestNames = [];
-  for (let g = 1; g <= 3; g++) {
-    const gName = getResponseValueByTitle(formIndex, response, `Guest ${g} Name`);
-    if (gName) guestNames.push(gName);
-  }
+  const name = String(getResponseValueByTitle(formIndex, response, TEMPLATE_ITEM_TITLES.NAME) || 'Unknown').trim();
   const adminNotes = getAdminNotesResponse(formIndex, response);
   // Points at this specific submission (requires setAllowResponseEdits(true)
   // on the template — see getOrCreateTemplateForm()), not the shared form editor.
   const responseEditUrl = response.getEditResponseUrl();
   const submittedAt = response.getTimestamp();
   const partyId = response.getId();
-  const partySize = 1 + Math.min(guestCount, guestNames.length);
+
+  const people = resolvePeopleOnResponse(formIndex, response, name, adminNotes);
+  const partySize = people.length;
 
   const attendanceMode = getResponseValueByTitle(formIndex, response, TEMPLATE_ITEM_TITLES.ATTENDANCE_MODE);
   if (attendanceMode === ATTENDANCE_MODE_CHOICES.ALL_DATES) {
     return processAllDatesResponse({
       formIndex, response, registryIndex, protectedKeys, existingRowIndex, orderAheadDays,
-      name, guestCount, guestNames, adminNotes, responseEditUrl, submittedAt, partyId, partySize
+      name, people, adminNotes, responseEditUrl, submittedAt, partyId, partySize
     });
   }
 
-  // Individual-dates path — also the ONLY path for Regular-series forms,
-  // which never carry an Attendance Mode question at all. Two roster grids:
-  // ATTENDANCE_GRID's rows are every date on the form, LUNCH_GRID's rows are
-  // only the lunch-eligible ("not Not-Serving") subset — see buildDateLabelSets().
+  // Specific-dates path. Two roster grids: ATTENDANCE_GRID's rows are every
+  // date on the form, LUNCH_GRID's rows are only the lunch-eligible ("not
+  // Not-Serving") subset — see buildDateLabelSets().
   const attendanceGrid = getGridResponseByTitle(formIndex, response, TEMPLATE_ITEM_TITLES.ATTENDANCE_GRID);
   const lunchGrid = getGridResponseByTitle(formIndex, response, TEMPLATE_ITEM_TITLES.LUNCH_GRID);
   if (!attendanceGrid) return [];
-
-  const people = [{ name, personType: 'Attendee', primaryRegistrant: 'Self', columnLabel: 'You', baseNotes: adminNotes }];
-  for (let g = 0; g < Math.min(guestCount, guestNames.length); g++) {
-    people.push({
-      name: guestNames[g] || `Guest ${g + 1} of ${name}`, personType: 'Guest', primaryRegistrant: name,
-      columnLabel: `Guest ${g + 1}`, baseNotes: ''
-    });
-  }
 
   const rows = [];
   attendanceGrid.rows.forEach((dateLabel, rowIdx) => {
@@ -3205,30 +3191,30 @@ function processFormResponse(formIndex, response, registryIndex, protectedKeys, 
 function processAllDatesResponse(args) {
   const {
     formIndex, response, registryIndex, protectedKeys, existingRowIndex, orderAheadDays,
-    name, guestCount, guestNames, adminNotes, responseEditUrl, submittedAt, partyId, partySize
+    people, adminNotes, responseEditUrl, submittedAt, partyId, partySize
   } = args;
 
-  const attendeeLunch = getResponseValueByTitle(formIndex, response, TEMPLATE_ITEM_TITLES.ALL_DATES_ATTENDEE_LUNCH) || 'No Lunch';
-  const people = [{ name, personType: 'Attendee', lunchType: attendeeLunch, primaryRegistrant: 'Self', adminNotes }];
-  for (let g = 0; g < Math.min(guestCount, guestNames.length); g++) {
-    const lunch = getResponseValueByTitle(formIndex, response, allDatesGuestLunchTitle(g + 1)) || 'No Lunch';
-    people.push({ name: guestNames[g] || `Guest ${g + 1} of ${name}`, personType: 'Guest', lunchType: lunch, primaryRegistrant: name, adminNotes: '' });
-  }
+  // A single checkbox of PERSON_COLUMN_LABELS: who eats, applied to every
+  // date. Checked-but-unnamed columns are already filtered out, since
+  // `people` only contains rows for guests who were actually named.
+  const eaters = getResponseValueByTitle(formIndex, response, TEMPLATE_ITEM_TITLES.ALL_DATES_LUNCH_PEOPLE) || [];
+  const eaterSet = new Set(Array.isArray(eaters) ? eaters : [eaters]);
 
   const formId = formIndex.formId;
   const matchingEntries = Object.keys(registryIndex).filter(k => k.startsWith(`${formId}|`)).map(k => registryIndex[k]);
 
   const rows = [];
   people.forEach(person => {
+    const lunchType = eaterSet.has(person.columnLabel) ? 'Yes - Lunch' : 'No Lunch';
     saveAllDatesRegistryEntry(formId, {
-      name: person.name, personType: person.personType, lunchType: person.lunchType,
-      primaryRegistrant: person.primaryRegistrant, adminNotes: person.adminNotes,
+      name: person.name, personType: person.personType, lunchType,
+      primaryRegistrant: person.primaryRegistrant, adminNotes: person.baseNotes || '',
       formEditUrl: responseEditUrl, submittedAt: submittedAt.toISOString(), partyId, partySize
     });
     matchingEntries.forEach(registryEntry => {
       rows.push(buildRegistrantRow({
-        registryEntry, name: person.name, personType: person.personType, lunchType: person.lunchType,
-        primaryRegistrant: person.primaryRegistrant, adminNotes: person.adminNotes, formEditUrl: responseEditUrl,
+        registryEntry, name: person.name, personType: person.personType, lunchType,
+        primaryRegistrant: person.primaryRegistrant, adminNotes: person.baseNotes || '', formEditUrl: responseEditUrl,
         protectedKeys, existingRowIndex, submittedAt, orderAheadDays, partyId, partySize
       }));
     });

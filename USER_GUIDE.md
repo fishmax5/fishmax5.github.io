@@ -20,36 +20,51 @@ Everything runs on a schedule. You rarely need to press anything.
 
 ---
 
-## Naming your calendar events
+## Setting up your calendar events
 
 This is the only "syntax" in the whole system, and it's the part worth getting
-right — the title and description control what the system does.
+right.
 
-| You write | It means |
+**The title is just the program name.** That's what attendees see on a shared
+calendar, so no settings go there.
+
+**Everything else goes in the event description, in square brackets:**
+
+| In the description | It means |
 |---|---|
-| `Chess Night` | A program with **no capacity limit** |
-| `Yoga Basics [Cap: 12]` | Capped at **12 people**; #13 is waitlisted automatically |
-| `*Yoga Basics [Cap: 12]` | **Tentative** — no form is created yet (see below) |
+| *(nothing)* | A program with **no capacity limit**, grouped by month |
+| `[Cap: 12]` | Capped at **12 people**; #13 is waitlisted automatically |
+| `[Fixed]` | One continuous series — **one form** for the whole run |
+| `[Cap: 12, Fixed]` | Both. `[Cap: 12] [Fixed]` on separate lines works too. |
 
-**Capacity** goes in square brackets in the title: `[Cap: 12]`. Leave it off for
-unlimited.
+You can write anything else you like in the description around them — only
+brackets containing `Cap:` or `Fixed` are read.
 
-**Fixed series** — put `[Fixed]` **in the event description**, not the title.
-A Fixed series is one continuous run (a 6-week course) that gets *one* form for
-the whole thing. Without it, events are grouped **by month**, so a program
-running all year gets a separate form for January, February, and so on.
+**About `[Fixed]`:** use it for something like a 6-week course, where one
+registration should cover the whole run. Without it, sessions are grouped **by
+month**, so a program running all year gets a separate form for January,
+February, and so on — which is what you want for a drop-in weekly thing.
 
-> If you have older events with `Fixed` in the *title*, they still work — the
-> system logs a reminder to move it. New events should use the description.
+> Older events with `[Cap: 12]` or `Fixed` in the **title** still work — the
+> system reads them and logs a reminder to move them. New events should put
+> everything in the description.
 
-**Tentative events** — start the title with `*` and the system leaves it alone
-entirely: no form, no dashboard row. Use this while a date is still being
-confirmed. When you remove the `*`, the event flows through normally on the next
-sync and gets its form.
+**Tentative events** — start the **title** with `*`:
+
+| Title | Result |
+|---|---|
+| `Yoga Basics` | Normal — gets a form |
+| `*Yoga Basics` | **Tentative** — no form, no dashboard row |
+
+Use it while a date is still being confirmed. Remove the `*` and the event flows
+through normally on the next sync and gets its form.
 
 > Removing the `*` is safe and creates no duplicates. Re-adding a `*` to an
 > event that *already* has registrations does **not** delete anything — existing
 > registrations are kept.
+
+**The registration link** appears in the event description automatically, as a
+clickable "📝 Register for …" link. Leave it alone; the system keeps it current.
 
 ---
 
@@ -155,19 +170,32 @@ those people, then clear the rows.
 
 ## What registrants see
 
-The form asks their **name**, whether they're bringing **guests (0–3)**, and then
-shows a roster:
+Every form is the same shape. **Page 1** asks:
+
+- **Name** (required)
+- **Guest 1 / 2 / 3 Name** — all optional. There's no "how many guests?"
+  question; the headcount is simply how many names they fill in.
+- **Attendance Mode**, which is the only fork in the form:
+
+| They pick | They get |
+|---|---|
+| **Everyone, every date** | One question: who's eating. Applied to every date. |
+| **Let me pick specific dates/people** | The full roster grid |
+
+Most people take the first option and are done in three questions.
+
+The roster, for those who want it:
 
 ```
 Who is Attending Each Date?
-                 You   Guest 1   Guest 2
-  Tue Aug 5       ☑       ☑         ☐
-  Thu Aug 7       ☑       ☐         ☐
+                 You   Guest 1   Guest 2   Guest 3
+  Tue Aug 5       ☑       ☑         ☐         ☐
+  Thu Aug 7       ☑       ☐         ☐         ☐
 
 Who Needs Lunch Each Date?
-                 You   Guest 1   Guest 2
-  Tue Aug 5       ☑       ☑         ☐
-  Thu Aug 7       ☐       ☐         ☐
+                 You   Guest 1   Guest 2   Guest 3
+  Tue Aug 5       ☑       ☑         ☐         ☐
+  Thu Aug 7       ☐       ☐         ☐         ☐
 ```
 
 Dates are rows, people are columns — so any guest can attend or skip any single
@@ -177,15 +205,15 @@ A few things worth knowing:
 
 - **The link you hand out arrives with every box already checked.** Most people
   are coming to everything, so they just uncheck exceptions and submit.
+- **Columns always show all three guests.** Columns for guests they didn't name
+  are ignored, so there's no harm in leaving them checked.
 - Each date shows the **meal shorthand** next to it, and `(FULL - Waitlist)` once
   a capped session runs out of seats — so nobody joins a waitlist unknowingly.
-- **Guest names are required.** You can't pick "3 guests" and cater for two.
+- Choosing **Everyone, every date** on a `[Fixed]` series also covers dates
+  added to that series *later* — they don't need to re-register.
 - There's a dedicated **Allergies / Dietary Needs** field.
 - Email addresses are collected, so people get a receipt with a link to **edit
   their own response** later.
-- **Fixed series only:** an "Attendance Mode" question up front — *Sign up for
-  all dates* (pick lunch once, applied to every session, including dates added
-  to the series later) or *Select individual dates*.
 
 If someone changes their mind and submits again, the new answers win and the old
 row is marked `Superseded`.
@@ -219,9 +247,13 @@ Press a menu item when you want something *now* instead of waiting.
 ## Common tasks
 
 **Add a new program**
-Create the calendar event with the right title. Wait for the next sync (or press
-Sync Cal). The registration link appears in the event description and on the
-dashboard.
+Create the calendar event — program name as the title, any `[Cap: N]` / `[Fixed]`
+settings in the description. Wait for the next sync (or press Sync Cal). The
+registration link appears in the event description and on the dashboard.
+
+**Change a program's capacity**
+Edit `[Cap: N]` in the event description. New sign-ups respect the new number on
+the next sync; already-recorded rows keep the status they were given.
 
 **Change what's for lunch**
 Edit **Lunch_Schedule**. Forms update themselves.
