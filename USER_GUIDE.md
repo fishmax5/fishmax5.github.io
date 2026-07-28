@@ -260,14 +260,6 @@ Master_Lunch_Dashboard and manually-marked registrant rows survive.
 
 ---
 
-## Known issues
-
-- **Resize All Sheets doesn't currently produce the intended widths.** Google's
-  auto-resize behaves inconsistently, and this is still being worked on. It's
-  harmless to run — it only touches column widths — it just may not do much.
-
----
-
 ## Troubleshooting
 
 **A new event didn't get a form**
