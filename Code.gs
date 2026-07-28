@@ -232,6 +232,21 @@ const MONTH_COLOR_MAP = {
   'December 2026': '#E69AC8'
 };
 
+/**
+ * Column sizing. Every column is autofitted and then padded out to this
+ * multiple of its fitted width, so text never sits flush against the cell
+ * edge and a dropdown arrow never overlaps the value under it.
+ *
+ * The MAX clamp is load-bearing, not decoration: autofit on a long
+ * Admin_Notes or "Programs Today" cell already produces a very wide column,
+ * and 130% of "very wide" is unusable. The MIN keeps a column of 0/1 counts
+ * from collapsing to a sliver. Both are in pixels; tune here and re-run
+ * resizeAllSheets() to apply to existing tabs.
+ */
+const COLUMN_WIDTH_BUFFER_MULTIPLIER = 1.3;
+const MIN_COLUMN_WIDTH_PX = 60;
+const MAX_COLUMN_WIDTH_PX = 400;
+
 // Status color palettes (kept together for easy re-theming).
 const EVENT_STATUS_COLORS = {
   '🟢 Open': '#D9EAD3',
@@ -1714,9 +1729,55 @@ function autosizeColumns(sheet, options) {
       sheet.getRange(1, 1, lastRow, lastCol).setWrapStrategy(SpreadsheetApp.WrapStrategy.CLIP);
     }
     sheet.autoResizeColumns(1, lastCol);
+    applyColumnWidthBuffer(sheet, lastCol);
   } catch (err) {
     log(`autosizeColumns skipped on "${sheet.getName()}": ${err}`);
   }
+}
+
+/**
+ * Pads already-autofitted columns out to COLUMN_WIDTH_BUFFER_MULTIPLIER of
+ * their fitted width, clamped to [MIN_COLUMN_WIDTH_PX, MAX_COLUMN_WIDTH_PX].
+ * Assumes the caller just ran autoResizeColumns() — it reads the fitted
+ * widths rather than re-fitting.
+ *
+ * On call counts, since this runs on every render of every tab: the fit is
+ * ONE batched autoResizeColumns() (not one autoResizeColumn() per column),
+ * and while the N getColumnWidth() reads are unavoidable — SpreadsheetApp
+ * has no batch width read — the WRITES are grouped. Consecutive columns
+ * landing on the same target width go out as a single setColumnWidths()
+ * run, and after clamping that happens a lot: every column pinned to the
+ * cap collapses into one call, as does every run of similar short columns.
+ */
+function applyColumnWidthBuffer(sheet, lastCol) {
+  const targets = [];
+  for (let col = 1; col <= lastCol; col++) {
+    const padded = Math.round(sheet.getColumnWidth(col) * COLUMN_WIDTH_BUFFER_MULTIPLIER);
+    targets.push(Math.max(MIN_COLUMN_WIDTH_PX, Math.min(padded, MAX_COLUMN_WIDTH_PX)));
+  }
+
+  let runStart = 0;
+  for (let i = 1; i <= targets.length; i++) {
+    if (i < targets.length && targets[i] === targets[runStart]) continue;
+    sheet.setColumnWidths(runStart + 1, i - runStart, targets[runStart]);
+    runStart = i;
+  }
+}
+
+/**
+ * One-shot padded autofit across EVERY sheet in the workbook, for running
+ * by hand from the Apps Script editor after changing the width constants
+ * above (or to fix up a tab that predates them).
+ *
+ * Deliberately NOT wired into any render path or the menu: each render
+ * already calls autosizeColumns() on the single tab it just rewrote, which
+ * is strictly cheaper than re-walking the whole workbook, and calling both
+ * would size every sheet twice for no gain.
+ */
+function resizeAllSheets() {
+  const sheets = SpreadsheetApp.getActiveSpreadsheet().getSheets();
+  sheets.forEach(sheet => autosizeColumns(sheet, { force: true }));
+  log(`resizeAllSheets: padded autofit applied to ${sheets.length} sheet(s).`);
 }
 
 
@@ -3640,7 +3701,9 @@ function applyRegistrantsFormatting(sheet, headers, result) {
   }
 
   sheet.setConditionalFormatRules(rules);
-  autosizeColumns(sheet, { minCols: headers.length });
+  // No autosize here on purpose: this runs as renderFlatDateSheet()'s
+  // afterWrite hook, and that function autosizes immediately afterward.
+  // Doing it in both places sized Registrants and Triage twice per render.
 }
 
 function renderLunchScheduleSheet(force, allRows) {
