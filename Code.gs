@@ -1765,19 +1765,22 @@ function applyColumnWidthBuffer(sheet, lastCol) {
 }
 
 /**
- * One-shot padded autofit across EVERY sheet in the workbook, for running
- * by hand from the Apps Script editor after changing the width constants
- * above (or to fix up a tab that predates them).
+ * One-shot padded autofit across EVERY sheet in the workbook. Exposed on
+ * the menu ("Resize All Sheets") and safe to run any time — it only ever
+ * sets column widths, so there's no data, formatting, or form state to
+ * lose. Use it after tuning the width constants above, or to fix up a tab
+ * that predates them.
  *
- * Deliberately NOT wired into any render path or the menu: each render
- * already calls autosizeColumns() on the single tab it just rewrote, which
- * is strictly cheaper than re-walking the whole workbook, and calling both
- * would size every sheet twice for no gain.
+ * Deliberately NOT called from any render path: each render already
+ * autosizes the single tab it just rewrote, which is strictly cheaper than
+ * re-walking the workbook, and doing both would size every sheet twice.
  */
 function resizeAllSheets() {
-  const sheets = SpreadsheetApp.getActiveSpreadsheet().getSheets();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheets = ss.getSheets();
   sheets.forEach(sheet => autosizeColumns(sheet, { force: true }));
   log(`resizeAllSheets: padded autofit applied to ${sheets.length} sheet(s).`);
+  ss.toast(`Resized ${sheets.length} sheet(s) ✅`, 'Calendar & Form Manager', 5);
 }
 
 
@@ -2039,8 +2042,10 @@ function computeOrderAheadFlag(eventDate, submittedAt, orderAheadDays) {
 // ============================================================================
 
 /**
- * Deliberately just the three things anyone needs day to day. The setup
- * entry points — initSheet() (rebuild every tab + formatting) and
+ * Deliberately small: the three things anyone needs day to day, plus
+ * Resize All Sheets, which is safe to click at any time (it only touches
+ * column widths — no data, no formatting, no forms). The setup entry
+ * points — initSheet() (rebuild every tab + formatting) and
  * initializeAndSyncAll() — are still here and still work; they're just run
  * from the Apps Script editor now rather than sitting in a menu where a
  * mis-click reformats the whole workbook.
@@ -2051,6 +2056,8 @@ function onOpen() {
     .addItem('Sync Cal', 'syncCalendars')
     .addItem('Sync Registrations', 'syncRegistrations')
     .addItem('Check Triggers', 'writeTriggers')
+    .addSeparator()
+    .addItem('Resize All Sheets', 'resizeAllSheets')
     .addToUi();
 }
 
