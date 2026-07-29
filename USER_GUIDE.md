@@ -44,7 +44,9 @@ attempt makes duplicates).
 - Programs whose events **already carry a registration link** keep their
   existing form; it isn't replaced.
 - When it's done it **rebuilds every trigger**, redraws the dashboard, and
-  toasts a summary.
+  toasts a summary. The link it wrote into each calendar event is *not*
+  treated as a calendar change to react to, so finishing doesn't kick off a
+  pile of syncs.
 
 Press it once and let it run — expect a few minutes for a small calendar and
 up to half an hour for a big one, and watch rows appear on
@@ -433,6 +435,30 @@ That's the first-import problem — too many forms to build in one run. Press
 **Import Everything (First Run)** instead; it does the same work in batches and
 skips whatever already came through. Then press **Check Triggers** to be sure
 the schedule is back (the batched import does that itself at the end).
+
+**Programs vanished from Master_Program_Dashboard**
+The system removes a session when its calendar event is gone — but it now
+refuses to do that *en masse*: if more than a handful of sessions look deleted
+at once, it changes nothing, logs why, and tells the admin address, because
+that pattern nearly always means a calendar didn't respond rather than that
+everything was cancelled. Calendars it couldn't read this run are skipped
+entirely.
+
+If sessions did disappear (from an older version), get them back with:
+
+1. **Import Everything (First Run)** — re-imports the sessions and re-adopts
+   the forms already linked in the calendar events.
+2. Ask your developer to run `restoreTriagedRegistrants()` from the Apps
+   Script editor — that moves people back from **Deleted_Event_Triage** onto
+   **Lunch_and_Event_Registrants** for every session that's back. This is
+   worth doing before anything else touches those rows: registrations that
+   were already imported *only* exist on those tabs, so re-syncing the forms
+   will not bring them back.
+3. **Sync Registrations**.
+
+If sessions really were all cancelled and you want them cleared, your
+developer can run `confirmLargeTriage()` and then press **Sync Cal** — that
+permits exactly one oversized sweep.
 
 **"Import Everything" seems stuck**
 Look at **Master_Program_Dashboard** — if rows are still appearing every few

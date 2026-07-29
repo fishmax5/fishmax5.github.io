@@ -139,6 +139,26 @@
  *      A grid column whose guest name was left blank is ignored at parse
  *      time, so the pre-checked columns for guests you didn't bring cost
  *      nothing.
+ *    - OUR OWN CALENDAR EDITS MUST NOT COME BACK AS WORK. Removing the
+ *      calendar-edit triggers during a sync stops them FIRING, not the
+ *      changes accumulating — so re-creating them afterwards handed
+ *      onCalendarChange() one queued description write per event, each of
+ *      which escalated to a full syncCalendars(). An import of 272 events
+ *      became a queue of full syncs. primeCalendarSyncTokens() now advances
+ *      each calendar's sync token past our own edits immediately before the
+ *      triggers go back on (in syncCalendarsInternal()'s finally, and at the
+ *      end of a bootstrap).
+ *    - TRIAGE DISTRUSTS ITSELF. triageDeletedSessions() is the only thing
+ *      that removes sessions, and "the calendar didn't come back" used to
+ *      read identically to "every session was deleted." It now ignores
+ *      calendars it could not READ, ignores rows it cannot attribute to one
+ *      it did read, refuses any sweep that would take out most of the table
+ *      (TRIAGE_MAX_SESSIONS_PER_RUN / TRIAGE_MAX_FRACTION_PER_RUN, overridden
+ *      once by confirmLargeTriage()), and stands down entirely while a
+ *      bootstrap import is writing the table. restoreTriagedRegistrants()
+ *      puts rows back if a sweep did fire wrongly — necessary because the
+ *      import only reads responses newer than the last sync, so a triaged
+ *      registrant exists nowhere else.
  *    - THE FIRST IMPORT IS A SLICED JOB, NOT A SYNC. syncCalendars() is cheap
  *      only because it normally has nothing to do. Importing a real calendar
  *      from scratch — a form per program, a description write per event —
@@ -1467,14 +1487,28 @@ function formatDateLabelWithMeal(date, location, capacityHint) {
  * optional { 'yyyy-MM-dd': CAPACITY_HINT_SUFFIX } map (see
  * buildCapacityHintsFromRegistryRows()) — omit it and no date gets a
  * capacity hint.
+ *
+ * Both lists are DE-DUPLICATED. A group with two sessions on the same day —
+ * a morning and an afternoon sitting of the same program — produces the same
+ * label twice, and a Google Forms grid rejects duplicate row labels outright
+ * ("Invalid data updating form"), which fails the whole form write and takes
+ * the date list with it. Collapsing them costs nothing downstream: a grid row
+ * is matched back to its session by label (registryIndex is keyed
+ * `formId|label`), so the two sittings were always going to resolve to one
+ * row anyway.
  */
 function buildDateLabelSets(dates, locationName, capacityHints) {
   capacityHints = capacityHints || {};
-  const allDateLabels = dates.map(d => formatDateLabelWithMeal(d, locationName, capacityHints[formatDateKey(d)]));
-  const lunchDateLabels = dates
-    .filter(d => isLunchOfferedOn(d, locationName))
-    .map(d => formatDateLabelWithMeal(d, locationName, capacityHints[formatDateKey(d)]));
+  const label = d => formatDateLabelWithMeal(d, locationName, capacityHints[formatDateKey(d)]);
+  const allDateLabels = dedupePreservingOrder(dates.map(label));
+  const lunchDateLabels = dedupePreservingOrder(dates.filter(d => isLunchOfferedOn(d, locationName)).map(label));
   return { allDateLabels, lunchDateLabels };
+}
+
+/** First occurrence of each value, in the order they appeared. */
+function dedupePreservingOrder(values) {
+  const seen = new Set();
+  return values.filter(v => (seen.has(v) ? false : (seen.add(v), true)));
 }
 
 /**
@@ -2677,6 +2711,10 @@ function onCalendarChange(e) {
 }
 
 function processCalendarDeltaForCalendar(calendarId) {
+  if (isBootstrapActive()) {
+    log(`processCalendarDeltaForCalendar: a large-setup import is in progress — skipping (it is editing these events itself).`);
+    return;
+  }
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(SYNC_LOCK_WAIT_MS)) {
     log('processCalendarDeltaForCalendar: another sync is already running — skipping this run.');
@@ -2758,6 +2796,45 @@ function fetchCalendarDelta(calendarId) {
   }
 
   return { fullSyncRequired: false, changedEvents };
+}
+
+/**
+ * Advances every calendar's sync token past changes THIS SCRIPT just made,
+ * without acting on them. Call it after anything that edits calendar events,
+ * immediately before the calendar-edit triggers go back on.
+ *
+ * Removing the triggers during a sync only stops them FIRING; it does not
+ * stop the changes accumulating. Re-creating them afterwards therefore hands
+ * onCalendarChange() a backlog of our own description writes — one per event
+ * — every one of which reads as "relevant" and escalates to a full
+ * syncCalendars(). One import of 272 events becomes a queue of full syncs,
+ * each re-reading every calendar and re-rendering every tab. That storm is
+ * what this prevents.
+ *
+ * The trade-off is deliberate: a genuine third-party edit made in the same
+ * window is drained too, and waits for the next scheduled full sync (hourly
+ * for registrations, daily for calendars) instead of being reacted to
+ * immediately. Losing a few minutes of reaction time beats a self-sustaining
+ * sync loop.
+ */
+function primeCalendarSyncTokens(reason) {
+  let primed = 0;
+  Object.keys(CALENDAR_MAP).forEach(calendarId => {
+    try {
+      const result = fetchCalendarDelta(calendarId);
+      if (result.fullSyncRequired) {
+        log(`ℹ️ Could not prime the sync token for "${CALENDAR_MAP[calendarId]}" — its next delta check will re-baseline.`);
+        return;
+      }
+      primed++;
+    } catch (err) {
+      // Typically the Calendar Advanced Service not being enabled. Nothing
+      // here is load-bearing enough to fail a sync over.
+      log(`ℹ️ Could not prime the sync token for "${CALENDAR_MAP[calendarId]}" (${err}).`);
+    }
+  });
+  if (primed > 0) log(`Primed ${primed} calendar sync token(s) past this ${reason}'s own edits.`);
+  return primed;
 }
 
 function isRawEventAllDay(ev) {
@@ -2956,6 +3033,9 @@ function syncCalendarsInternal() {
   } finally {
     flushPersistentRegistries(); // never strand a form-label fingerprint written during this run
     flushAdminDigest('Calendar sync');
+    // Order matters: swallow our own description edits BEFORE the triggers
+    // that would otherwise react to them come back on.
+    primeCalendarSyncTokens('sync');
     writeCalendarChangeTriggers();
   }
 }
@@ -3440,15 +3520,25 @@ function runBootstrapSlice() {
 function finishBootstrap(state, problem) {
   state = state || {};
   deleteBootstrapResumeTriggers();
-  clearBootstrapState();
 
+  // Rendered while the bootstrap still counts as active, deliberately: that
+  // is what keeps triageDeletedSessions() out of this render. Everything on
+  // the session table was put there by the import that just ran, and a
+  // half-read calendar at this exact moment must never be allowed to
+  // conclude that all of it has been deleted.
   try {
     renderProgramDashboard(true);
   } catch (err) {
     log(`⚠️ Bootstrap: could not render the dashboard at the end (${err}) — the data is imported; re-run Sync Cal to redraw.`);
   }
 
+  clearBootstrapState();
+
   try {
+    // Swallow the import's own description edits before the calendar-edit
+    // triggers go back on, or every one of the events just written becomes a
+    // full syncCalendars() a moment later.
+    primeCalendarSyncTokens('import');
     writeTriggers(); // daily sync, hourly registrations, one calendar-edit trigger per calendar
   } catch (err) {
     // Automation staying paused is the one outcome worth shouting about.
@@ -3755,6 +3845,84 @@ function moveRegistrantsToTriage(registrantsSheet, deletedEventInfo) {
     noteForAdmin('Deleted events sent to triage',
       `${info.cleanTitle} (${info.location}) — its calendar event is gone; registrants need confirming.`);
   });
+}
+
+/**
+ * The inverse of moveRegistrantsToTriage(): puts triaged rows back on
+ * Lunch_and_Event_Registrants for every session that is on the dashboard
+ * again.
+ *
+ * Needed because a triage sweep is not recoverable from the forms. The import
+ * only ever reads responses newer than the last sync, so a registration that
+ * was already imported and then triaged exists nowhere else — moving the row
+ * back IS the recovery. Rows for sessions that are still gone are left in
+ * triage, and an identity already present on the Registrants tab is dropped
+ * rather than duplicated.
+ *
+ * Run from the Apps Script editor. Returns the number of rows restored.
+ */
+function restoreTriagedRegistrants() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const triageSheet = ss.getSheetByName(SHEET_NAMES.TRIAGE);
+  const registrySheet = ss.getSheetByName(SHEET_NAMES.PROGRAM_DASHBOARD);
+  if (!triageSheet || !registrySheet) {
+    log('restoreTriagedRegistrants: no triage tab or no dashboard — nothing to do.');
+    return 0;
+  }
+
+  const triageHeaders = HEADERS.Deleted_Event_Triage;
+  const regHeaders = HEADERS.Lunch_and_Event_Registrants;
+  const tMap = getIndexMap(triageHeaders);
+  const rMap = getIndexMap(regHeaders);
+
+  const sessionRows = readAllSectionedRows(registrySheet, HEADERS.Master_Program_Dashboard, 'Event_ID');
+  const sessionMap = getIndexMap(HEADERS.Master_Program_Dashboard);
+  const liveEventIds = new Set(sessionRows.map(row => row[sessionMap['Event_ID']]).filter(Boolean));
+  if (liveEventIds.size === 0) {
+    log('restoreTriagedRegistrants: the session table is empty — import the calendar first, then run this again.');
+    return 0;
+  }
+
+  const registrantsSheet = getOrCreateSheet(ss, SHEET_NAMES.LUNCH_EVENT_REGISTRANTS);
+  const registrantRows = readAllSectionedRows(registrantsSheet, regHeaders, 'Event_ID');
+  const present = new Set(registrantRows.map(row =>
+    `${row[rMap['Event_ID']]}|${normalizeNameKey(row[rMap['Name']])}|${row[rMap['Person_Type']]}`));
+
+  const triageRows = readAllSectionedRows(triageSheet, triageHeaders, 'Event_ID');
+  const stayInTriage = [];
+  const restored = [];
+
+  triageRows.forEach(row => {
+    const eventId = row[tMap['Event_ID']];
+    if (!eventId || !liveEventIds.has(eventId)) { stayInTriage.push(row); return; }
+
+    const key = `${eventId}|${normalizeNameKey(row[tMap['Name']])}|${row[tMap['Person_Type']]}`;
+    if (present.has(key)) {
+      log(`restoreTriagedRegistrants: ${row[tMap['Name']]} is already on the Registrants tab for this session — dropping the triaged copy.`);
+      return;
+    }
+
+    // Triage is a superset of the registrant layout, so this copies by name.
+    const restoredRow = new Array(regHeaders.length).fill('');
+    regHeaders.forEach(h => { if (tMap[h] !== undefined) restoredRow[rMap[h]] = row[tMap[h]]; });
+    const notes = String(restoredRow[rMap['Admin_Notes']] || '').trim();
+    const stamp = `Restored from ${SHEET_NAMES.TRIAGE} on ${Utilities.formatDate(new Date(), TIMEZONE, 'M/d/yyyy')}.`;
+    restoredRow[rMap['Admin_Notes']] = notes ? `${notes} | ${stamp}` : stamp;
+    present.add(key);
+    restored.push(restoredRow);
+  });
+
+  if (restored.length === 0) {
+    log('restoreTriagedRegistrants: nothing in triage belongs to a session that is back.');
+    return 0;
+  }
+
+  renderRegistrantsSheet(false, registrantRows.concat(restored));
+  renderTriageSheet(false, stayInTriage);
+  log(`restoreTriagedRegistrants: put ${restored.length} row(s) back on "${SHEET_NAMES.LUNCH_EVENT_REGISTRANTS}"; ` +
+    `${stayInTriage.length} row(s) stay in triage (their session is still missing).`);
+  toastIfPossible(`Restored ${restored.length} registrant row(s) from triage ✅`);
+  return restored.length;
 }
 
 function backInjectCalendarDescriptions(group, formInfo) {
@@ -4459,6 +4627,7 @@ function isFormOnCurrentTemplate(form) {
  * of those registrations and are untouched.
  */
 function rebuildFormFromCurrentTemplate(form, context) {
+  clearFormNavigation(form);
   const items = form.getItems();
   for (let i = items.length - 1; i >= 0; i--) {
     form.deleteItem(items[i]);
@@ -4477,6 +4646,36 @@ function rebuildFormFromCurrentTemplate(form, context) {
 
 /** Ceiling on how many out-of-date forms one execution will rebuild — see migrateFormsToCurrentTemplate(). */
 const MAX_FORM_REBUILDS_PER_RUN = 5;
+
+/**
+ * Cuts every "go to section" link on a form: choice-level page navigation on
+ * list/multiple-choice items, and page-level navigation on the page breaks
+ * themselves.
+ *
+ * This is what a rebuild has to do FIRST. Deleting a page break that another
+ * item's choice still points at leaves the form describing a jump to a
+ * section that no longer exists, and Forms rejects the whole update with a
+ * flat "Invalid data updating form" — which is exactly how a migration fails
+ * on the old eight-section template, where seven choices point at branch
+ * pages. Neutralize the links, and the items delete cleanly.
+ */
+function clearFormNavigation(form) {
+  form.getItems().forEach(item => {
+    try {
+      const type = item.getType();
+      if (type === FormApp.ItemType.PAGE_BREAK) {
+        item.asPageBreakItem().setGoToPage(FormApp.PageNavigationType.CONTINUE);
+        return;
+      }
+      if (type !== FormApp.ItemType.LIST && type !== FormApp.ItemType.MULTIPLE_CHOICE) return;
+      const typed = type === FormApp.ItemType.LIST ? item.asListItem() : item.asMultipleChoiceItem();
+      const values = typed.getChoices().map(c => c.getValue()).filter(v => v !== '' && v !== null && v !== undefined);
+      if (values.length > 0) typed.setChoiceValues(values); // plain choices — no navigation attached
+    } catch (err) {
+      log(`ℹ️ Could not clear navigation on "${item.getTitle()}" of form ${form.getId()} (${err}) — continuing.`);
+    }
+  });
+}
 
 /**
  * Brings every live registration form up to the current template.
@@ -5059,23 +5258,62 @@ function renderProgramDashboard(force, options) {
 }
 
 /**
+ * A triage sweep this size is treated as a symptom, not an instruction — see
+ * triageDeletedSessions(). Both have to be exceeded before a sweep is
+ * refused, so deleting one whole small program still works normally while a
+ * "everything vanished" reading never does.
+ */
+const TRIAGE_MAX_SESSIONS_PER_RUN = 15;
+const TRIAGE_MAX_FRACTION_PER_RUN = 0.25;
+/** One-shot property set by confirmLargeTriage() to let the next sweep exceed those limits. */
+const TRIAGE_OVERRIDE_PROP_KEY = 'TRIAGE_OVERRIDE_ONCE';
+
+/**
  * Cross-checks in-memory session rows against what's genuinely still on the
  * calendars right now and drops any that are gone. Dropped sessions'
  * registrants are moved to Deleted_Event_Triage. Master_Program_Dashboard no
  * longer has a Manual_Override column, so nothing can be protected from
  * this anymore — every session's presence is strictly calendar-derived.
+ *
+ * WHICH MAKES THIS THE MOST DESTRUCTIVE FUNCTION IN THE FILE, and it is
+ * built to distrust itself accordingly:
+ *
+ *   1. A calendar that could not be READ proves nothing. getCalendarById()
+ *      returns null on a transient failure, and the old code read that as an
+ *      empty event list — i.e. "every session at that location is deleted."
+ *      Rows whose Calendar_Source we couldn't read are now left alone.
+ *   2. A sweep that would take out most of the table is refused outright.
+ *      Programs get cancelled a few at a time; 268 sessions disappearing at
+ *      once is a failed calendar read, a mid-import snapshot, or a bug — and
+ *      the cost of pausing is one log line, while the cost of proceeding is
+ *      the whole dashboard plus every registrant on it. confirmLargeTriage()
+ *      is the way to say "no, really".
+ *   3. While a bootstrap import is in flight, nothing is triaged at all: the
+ *      session table is being written as we read it.
  */
 function triageDeletedSessions(sessionRows, map, registrantsSheet) {
+  const empty = { rows: sessionRows, affectedFormIds: new Set(), registrantsMoved: false };
+
+  if (isBootstrapActive()) {
+    log('Triage skipped: a large-setup import is still writing the session table.');
+    return empty;
+  }
+
   const { start, end } = computeSyncDateRange();
 
   // Shares syncCalendarsInternal()'s fetch for this window — a full
   // initializeAndSyncAll() used to hit every calendar four separate times
   // (once per renderProgramDashboard(), plus the sync's own scan).
   const eventsByCalendar = getCalendarEventsForWindow(start, end);
+  const readableCalendars = new Set();
   const liveEventIds = new Set();
   Object.keys(CALENDAR_MAP).forEach(calendarId => {
     const events = eventsByCalendar[calendarId];
-    if (!events) return;
+    if (!events) {
+      log(`⚠️ Triage: "${CALENDAR_MAP[calendarId]}" could not be read this run — its sessions are left as they are.`);
+      return;
+    }
+    readableCalendars.add(calendarId);
     events.forEach(ev => {
       if (ev.isAllDayEvent()) return;
       const parsed = parseEventTitle(ev.getTitle());
@@ -5084,34 +5322,80 @@ function triageDeletedSessions(sessionRows, map, registrantsSheet) {
     });
   });
 
-  const keep = [];
-  const deletedEventInfo = {};
-  const affectedFormIds = new Set();
+  if (readableCalendars.size === 0) {
+    log('Triage skipped: no calendar could be read this run.');
+    return empty;
+  }
 
+  const doomedRows = [];
+  const deletedEventInfo = {};
   sessionRows.forEach(row => {
     const eventId = row[map['Event_ID']];
     const d = coerceDate(row[map['Event_Date']]);
-    const withinDetectableWindow = d && d >= start && d <= end;
-
-    if (withinDetectableWindow && eventId && !liveEventIds.has(eventId)) {
-      deletedEventInfo[eventId] = { cleanTitle: row[map['Clean_Title']], location: row[map['Location']] };
-      const formId = row[map['Form_ID']];
-      if (formId) affectedFormIds.add(formId);
-      return;
-    }
-    keep.push(row);
+    const source = row[map['Calendar_Source']];
+    // No Calendar_Source (a hand-added row) can't be attributed to a calendar
+    // we verified, so it is never triaged.
+    if (!eventId || !d || !source || !readableCalendars.has(source)) return;
+    if (d < start || d > end) return; // outside the window we can see
+    if (liveEventIds.has(eventId)) return;
+    doomedRows.push(row);
+    deletedEventInfo[eventId] = { cleanTitle: row[map['Clean_Title']], location: row[map['Location']] };
   });
 
   const deletedCount = Object.keys(deletedEventInfo).length;
-  if (deletedCount > 0) {
-    moveRegistrantsToTriage(registrantsSheet, deletedEventInfo);
-    log(`Triaged ${deletedCount} deleted event(s) during dashboard render.`);
+  if (deletedCount === 0) return empty;
+
+  if (isTriageTooBig(deletedCount, sessionRows.length)) {
+    const message = `Triage REFUSED: ${deletedCount} of ${sessionRows.length} session(s) looked deleted in one pass, ` +
+      `which is far more likely to be a bad calendar read than ${deletedCount} real cancellations. ` +
+      `Nothing was removed. If they really are all gone, run confirmLargeTriage() from the Apps Script ` +
+      `editor and let the next sync through.`;
+    log(`⚠️ ${message}`);
+    noteForAdmin('Sessions that look deleted', message);
+    return empty;
   }
+
+  const doomedSet = new Set(doomedRows);
+  const keep = sessionRows.filter(row => !doomedSet.has(row));
+  const affectedFormIds = new Set();
+  doomedRows.forEach(row => {
+    const formId = row[map['Form_ID']];
+    if (formId) affectedFormIds.add(formId);
+  });
+
+  moveRegistrantsToTriage(registrantsSheet, deletedEventInfo);
+  log(`Triaged ${deletedCount} deleted event(s) during dashboard render.`);
 
   // registrantsMoved tells callers that any registrant rows they were
   // holding from before this call are now stale — moveRegistrantsToTriage()
   // rewrites the Registrants tab.
-  return { rows: keep, affectedFormIds, registrantsMoved: deletedCount > 0 };
+  return { rows: keep, affectedFormIds, registrantsMoved: true };
+}
+
+/** Is this sweep big enough to need a human? Consumes the one-shot override if one is set. */
+function isTriageTooBig(deletedCount, totalRows) {
+  const overLimit = deletedCount > TRIAGE_MAX_SESSIONS_PER_RUN &&
+    deletedCount > totalRows * TRIAGE_MAX_FRACTION_PER_RUN;
+  if (!overLimit) return false;
+
+  const props = PropertiesService.getScriptProperties();
+  if (props.getProperty(TRIAGE_OVERRIDE_PROP_KEY)) {
+    props.deleteProperty(TRIAGE_OVERRIDE_PROP_KEY); // one sweep only
+    log('Large triage allowed once by confirmLargeTriage().');
+    return false;
+  }
+  return true;
+}
+
+/**
+ * MAINTENANCE — run from the Apps Script editor. Lets the NEXT sweep remove
+ * more sessions than the safety limit allows, once. Use it after checking
+ * that the sessions really are gone from the calendar.
+ */
+function confirmLargeTriage() {
+  PropertiesService.getScriptProperties().setProperty(TRIAGE_OVERRIDE_PROP_KEY, String(Date.now()));
+  log(`confirmLargeTriage: the next sweep may exceed ${TRIAGE_MAX_SESSIONS_PER_RUN} sessions. ` +
+    `Run "Sync Cal" to trigger it — the permission is used up by that one sweep.`);
 }
 
 /** After sessions are removed (their calendar event vanished), pushes an updated date list to any form those sessions belonged to. */
@@ -5140,6 +5424,13 @@ function refreshFormDateListsForForms(keptSessionRows, map, affectedFormIds) {
     const lunchLabels = lunchDateLabels.length > 0 ? lunchDateLabels : ['No upcoming dates'];
     if (applyFormDateLabels(formId, attendanceLabels, lunchLabels, { context: 'deleted-event cleanup' })) {
       log(`Refreshed form ${formId}'s date list to ${dates.length} remaining date(s) after a deleted-event cleanup.`);
+    }
+    if (dates.length === 0) {
+      // Emptying a live form is a big enough thing to say out loud: it means
+      // every session that form covered is gone from the calendar.
+      noteForAdmin('Registration forms left with no dates',
+        `Form ${formId} (${location || 'unknown location'}) now shows "No upcoming dates" — every session it covered ` +
+        `disappeared from the calendar. Check that this was intended.`);
     }
   });
   flushPersistentRegistries();
