@@ -36,7 +36,10 @@ attempt makes duplicates).
 
 **Import Everything (First Run)** exists for exactly this:
 
-- It **pauses all automation** first, so nothing else runs while it works.
+- It **pauses all automation** first — the scheduled syncs and the
+  calendar-watch triggers — and keeps them paused for the whole import, not
+  just the first minute of it. **Check Triggers** deliberately does nothing
+  while it's running (it says so); the import puts everything back itself.
 - It imports in **batches across several background runs**, a few minutes
   apart. The first batch happens while you watch; the rest carry on by
   themselves. Nothing is lost if a batch is cut short — the next one picks up

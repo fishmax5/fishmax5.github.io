@@ -168,7 +168,11 @@
  *      forms on the next attempt). bootstrapCalendars() (section 4b) pauses
  *      every trigger, imports in budgeted slices that hand off to each other
  *      via one-off triggers, and rebuilds the triggers only when it's done.
- *      syncCalendars()/syncRegistrations() stand down while it runs.
+ *      syncCalendars()/syncRegistrations() stand down while it runs, and
+ *      writeTriggers() refuses to put the paused ones back until it
+ *      finishes — a pause is only as good as the paths that can undo it, and
+ *      an import that spans half an hour gives "Check Triggers" plenty of
+ *      chances. Each slice re-asserts the pause as well.
  *    - LIVE FORMS ARE MIGRATED, NOT JUST THE TEMPLATE. A group's form is
  *      created once and reused for as long as the group runs, so bumping
  *      TEMPLATE_VERSION only ever fixed forms created afterward — everyone
@@ -2491,8 +2495,23 @@ function initializeAndSyncAll() {
  *    made directly on a calendar kicks off onCalendarChange() (which now
  *    does a cheap incremental check before deciding whether a full
  *    syncCalendars() is actually warranted — see section 3b).
+ *
+ * DECLINES while a bootstrap import is in flight, because that import
+ * deliberately took these triggers down (see pauseAutomationForBootstrap()).
+ * This is the guard that matters: the pause is only as good as the places
+ * that can undo it, and "Check Triggers" — pressed by someone watching a long
+ * import and wondering why nothing is scheduled — is exactly the reflex that
+ * would put a hundred queued calendar edits back in play mid-run. Only
+ * finishBootstrap() passes force, restoring everything when the import is
+ * genuinely done.
  */
-function writeTriggers() {
+function writeTriggers(force) {
+  if (!force && isBootstrapActive()) {
+    const message = `Triggers stay paused until the large-setup import finishes — it restores them itself.`;
+    log(`writeTriggers: ${message}`);
+    toastIfPossible(message);
+    return;
+  }
   const existingTriggers = ScriptApp.getProjectTriggers();
   const existingHandlers = existingTriggers.map(t => t.getHandlerFunction());
   let created = 0;
@@ -2513,7 +2532,7 @@ function writeTriggers() {
     log('Trigger for syncRegistrations() already exists — skipping.');
   }
 
-  created += writeCalendarChangeTriggers();
+  created += writeCalendarChangeTriggers(true); // the bootstrap check above already ran
 
   const message = created > 0
     ? `Created ${created} missing trigger(s) ✅`
@@ -2522,7 +2541,11 @@ function writeTriggers() {
   log(`writeTriggers complete: ${message}`);
 }
 
-function writeCalendarChangeTriggers() {
+function writeCalendarChangeTriggers(force) {
+  if (!force && isBootstrapActive()) {
+    log('writeCalendarChangeTriggers: skipped — a large-setup import has these paused on purpose.');
+    return 0;
+  }
   const existingTriggers = ScriptApp.getProjectTriggers();
   const existingCalendarTriggerSources = existingTriggers
     .filter(t => t.getHandlerFunction() === 'onCalendarChange')
@@ -3462,6 +3485,15 @@ function runBootstrapSlice() {
     state.lastSliceAt = Date.now();
     saveBootstrapState(state);
 
+    // Re-asserted EVERY slice, not just at the start. An import runs for
+    // half an hour across a dozen executions, and a single trigger that
+    // comes back during it — someone pressing "Check Triggers", a re-run of
+    // initSheet(), anything at all — puts every event this import has
+    // already touched back in onCalendarChange()'s queue, and the remaining
+    // slices then fight a sync storm instead of importing. Costs one
+    // getProjectTriggers() call per slice and normally removes nothing.
+    pauseAutomationForBootstrap();
+
     if (state.slices > BOOTSTRAP_MAX_SLICES) {
       finishBootstrap(state, `stopped after ${BOOTSTRAP_MAX_SLICES} slices without finishing`);
       return;
@@ -3539,7 +3571,9 @@ function finishBootstrap(state, problem) {
     // triggers go back on, or every one of the events just written becomes a
     // full syncCalendars() a moment later.
     primeCalendarSyncTokens('import');
-    writeTriggers(); // daily sync, hourly registrations, one calendar-edit trigger per calendar
+    // force: this IS the restore, and the state was cleared just above — but
+    // not relying on that ordering is what keeps automation from staying off.
+    writeTriggers(true); // daily sync, hourly registrations, one calendar-edit trigger per calendar
   } catch (err) {
     // Automation staying paused is the one outcome worth shouting about.
     log(`⚠️ Bootstrap: could not restore the triggers (${err}) — run "Check Triggers" from the menu.`);
@@ -3561,16 +3595,23 @@ function finishBootstrap(state, problem) {
   log('Automation restored. Run "Sync Registrations" (or wait for the hourly trigger) to pull in any existing form responses.');
 }
 
-/** Deletes the syncCalendars / syncRegistrations / onCalendarChange triggers for the duration of the import. */
+/**
+ * Deletes the syncCalendars / syncRegistrations / onCalendarChange triggers
+ * for the duration of the import. Idempotent by design — every slice calls
+ * it, so a trigger that reappears mid-import survives at most one slice.
+ */
+const BOOTSTRAP_PAUSED_HANDLERS = ['syncCalendars', 'syncRegistrations', 'onCalendarChange'];
+
 function pauseAutomationForBootstrap() {
-  const paused = ['syncCalendars', 'syncRegistrations', 'onCalendarChange'];
   let removed = 0;
   ScriptApp.getProjectTriggers().forEach(t => {
-    if (paused.indexOf(t.getHandlerFunction()) === -1) return;
+    if (BOOTSTRAP_PAUSED_HANDLERS.indexOf(t.getHandlerFunction()) === -1) return;
     ScriptApp.deleteTrigger(t);
     removed++;
   });
-  log(`Paused ${removed} trigger(s) for the duration of the import — finishBootstrap() puts them all back.`);
+  if (removed > 0) {
+    log(`Paused ${removed} trigger(s) for the duration of the import — finishBootstrap() puts them all back.`);
+  }
   return removed;
 }
 
@@ -3600,7 +3641,7 @@ function cancelBootstrapCalendars() {
   const state = getBootstrapState();
   if (!state) {
     deleteBootstrapResumeTriggers();
-    writeTriggers();
+    writeTriggers(true);
     log('No large-setup import was running — triggers verified anyway.');
     return;
   }
