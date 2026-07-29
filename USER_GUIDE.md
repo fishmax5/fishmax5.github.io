@@ -324,7 +324,7 @@ Under **🗓️ Calendar & Form Manager** at the top of the spreadsheet:
 |---|---|
 | **Sync Cal** | Reads the calendars, creates/updates forms |
 | **Sync Registrations** | Pulls in new form responses, recomputes everything |
-| **Check Triggers** | Makes sure the automatic schedule is in place |
+| **Check Triggers** | Resets the automatic schedule to exactly the expected triggers — safe to press any time, clears out duplicates |
 | **Import Everything (First Run)** | The batched first import — see [First run](#first-run) |
 | **Resize All Sheets** | Tidies column widths only — safe any time |
 
@@ -474,3 +474,26 @@ trigger and keeps whatever was already imported.
 Run **Check Triggers** — that rebuilds anything missing, including automation
 a first-run import paused and never got to restore. If that doesn't help, the
 script may need to be re-authorized from the Apps Script editor.
+
+**The same event seems to trigger a sync twice, or you see far more
+`onCalendarChange` activity than editing one event should cause**
+This is almost always more than one Google account having independently set
+up this project's triggers. **Check Triggers** now fully resets the calendar
+and sync triggers every time it's pressed — however many exist, all get
+removed and exactly the right number get recreated — so this fixes it
+**for whichever account presses it**. But an installable trigger belongs to
+the Google account that created it, and one account genuinely cannot see or
+remove another account's copies; if two different people have both run
+**Check Triggers** / **Import Everything** / `initSheet()` from their own
+logins, you now have two invisible-to-each-other sets both firing.
+
+To find and clear the other set: open the **Apps Script editor** for this
+project, click the **clock icon** (Triggers) in the left sidebar. Unlike
+anything this script can do for itself, that page lists **every** trigger
+regardless of who created it, with a "Created by" column — delete anything
+that isn't the account you intend to use going forward.
+
+Going forward, **only ever run setup and trigger actions from one Google
+account** — ideally whoever owns the spreadsheet. Everyone else can register,
+view dashboards, and hand-edit rows freely; just don't have more than one
+person press **Check Triggers**, **Import Everything**, or run `initSheet()`.

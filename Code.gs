@@ -148,6 +148,21 @@
  *      each calendar's sync token past our own edits immediately before the
  *      triggers go back on (in syncCalendarsInternal()'s finally, and at the
  *      end of a bootstrap).
+ *    - TRIGGERS ARE RESET, NOT PATCHED. writeTriggers() used to add a
+ *      trigger only if none existed, which cannot clean up a duplicate once
+ *      one is there. The real-world case: Apps Script installable triggers
+ *      are private to the Google account that created them, so a second
+ *      person running "Check Triggers"/initSheet() from their own login
+ *      creates a SECOND, mutually invisible set of calendar-edit triggers —
+ *      both then fire on every edit, forever. writeTriggers()/
+ *      writeCalendarChangeTriggers() now delete every trigger for a managed
+ *      handler THIS ACCOUNT can see and recreate exactly the intended set,
+ *      every time — see resetTriggersForHandler(). That fixes same-account
+ *      duplication outright; cross-account duplication needs a human to
+ *      open the Apps Script editor's Triggers page (which — unlike the
+ *      API — lists every trigger regardless of creator) and delete the
+ *      other account's copies, and to agree only one account manages
+ *      triggers going forward.
  *    - TRIAGE DISTRUSTS ITSELF. triageDeletedSessions() is the only thing
  *      that removes sessions, and "the calendar didn't come back" used to
  *      read identically to "every session was deleted." It now ignores
@@ -2489,12 +2504,38 @@ function initializeAndSyncAll() {
 }
 
 /**
- * Ensures the triggers this project depends on exist, without duplicates.
+ * Ensures the triggers this project depends on exist, WITH NO DUPLICATES —
  *  - Two time-driven triggers (daily calendar sync, hourly registration sync)
  *  - One calendar-update trigger per calendar in CALENDAR_MAP, so an edit
  *    made directly on a calendar kicks off onCalendarChange() (which now
  *    does a cheap incremental check before deciding whether a full
  *    syncCalendars() is actually warranted — see section 3b).
+ *
+ * A FULL RESET, not an add-if-missing: every trigger for a handler this
+ * project manages is deleted first, then exactly the intended set is
+ * created. See resetTriggersForHandler(). This is what makes it safe to
+ * press "Check Triggers" as often as you like — it can never leave two
+ * copies of the same trigger both firing, however many were sitting there
+ * before, and whatever left them there.
+ *
+ * THE ONE THING THIS CANNOT FIX: Apps Script installable triggers are
+ * private to the Google account that created them — ScriptApp.getProjectTriggers()
+ * only ever returns the triggers the CURRENTLY RUNNING account can see, never
+ * another account's. If two different people have each run "Check Triggers"
+ * / initSheet() / Import Everything on this project from their own Google
+ * logins, each created their OWN calendar-edit triggers, invisible to each
+ * other — so both fire on every calendar edit, independently, forever,
+ * and no run of this function (from either account) can see or remove the
+ * other's copies. That is what actually caused the extra calendar triggers
+ * this comment is here because of.
+ *   FIX: only ever run setup/trigger functions (this one, initSheet(),
+ *   bootstrapCalendars(), the "Check Triggers"/"Import Everything" menu
+ *   items) from ONE Google account — ideally whichever one owns the
+ *   spreadsheet. To find and remove another account's leftover triggers,
+ *   open the Apps Script editor's Triggers page (clock icon in the left
+ *   sidebar) — unlike the API, that page lists every trigger on the
+ *   project regardless of which account created it, with a "Created by"
+ *   column, and anyone with edit access can delete from there.
  *
  * DECLINES while a bootstrap import is in flight, because that import
  * deliberately took these triggers down (see pauseAutomationForBootstrap()).
@@ -2512,56 +2553,70 @@ function writeTriggers(force) {
     toastIfPossible(message);
     return;
   }
-  const existingTriggers = ScriptApp.getProjectTriggers();
-  const existingHandlers = existingTriggers.map(t => t.getHandlerFunction());
-  let created = 0;
 
-  if (existingHandlers.indexOf('syncCalendars') === -1) {
-    ScriptApp.newTrigger('syncCalendars').timeBased().everyDays(1).atHour(5).create();
-    created++;
-    log('Created daily trigger for syncCalendars().');
-  } else {
-    log('Trigger for syncCalendars() already exists — skipping.');
-  }
+  let removed = 0;
+  removed += resetTriggersForHandler('syncCalendars', () =>
+    ScriptApp.newTrigger('syncCalendars').timeBased().everyDays(1).atHour(5).create());
+  removed += resetTriggersForHandler('syncRegistrations', () =>
+    ScriptApp.newTrigger('syncRegistrations').timeBased().everyHours(1).create());
 
-  if (existingHandlers.indexOf('syncRegistrations') === -1) {
-    ScriptApp.newTrigger('syncRegistrations').timeBased().everyHours(1).create();
-    created++;
-    log('Created hourly trigger for syncRegistrations().');
-  } else {
-    log('Trigger for syncRegistrations() already exists — skipping.');
-  }
+  const calendarResult = writeCalendarChangeTriggers(true); // the bootstrap check above already ran
+  removed += calendarResult.removed;
 
-  created += writeCalendarChangeTriggers(true); // the bootstrap check above already ran
-
-  const message = created > 0
-    ? `Created ${created} missing trigger(s) ✅`
-    : 'All triggers already in place ✅';
+  const message = removed > 0
+    ? `Triggers rebuilt ✅ (cleared ${removed} duplicate/stale one(s) under this account — see the log if more keep appearing)`
+    : `All triggers verified — 1 daily, 1 hourly, ${calendarResult.created} calendar-edit ✅`;
   toastIfPossible(message); // also called from a trigger run, where there's no UI
   log(`writeTriggers complete: ${message}`);
 }
 
+/**
+ * Deletes every trigger for `handlerName` visible to this account, then
+ * calls `create` to install the replacement.
+ *
+ * Returns the number of EXCESS triggers found — existing.length minus the
+ * one this handler is meant to have, floored at 0. Every normal run removes
+ * exactly one (the trigger being replaced) and that's not worth reporting;
+ * this return value is what lets writeTriggers() tell "routine rebuild" from
+ * "there were actually duplicates" apart in its summary.
+ */
+function resetTriggersForHandler(handlerName, create) {
+  const existing = ScriptApp.getProjectTriggers().filter(t => t.getHandlerFunction() === handlerName);
+  existing.forEach(t => ScriptApp.deleteTrigger(t));
+  const excess = Math.max(existing.length - 1, 0);
+  if (excess > 0) {
+    log(`⚠️ Found ${existing.length} "${handlerName}" triggers (expected at most 1) — removed all of them before rebuilding.`);
+  }
+  create();
+  return excess;
+}
+
+/**
+ * Same reset as resetTriggersForHandler(), but for the one handler with
+ * MULTIPLE expected triggers (one per calendar) — so "how many did we
+ * expect" has to be compared after creating, not before. `removed` in the
+ * result is the EXCESS over that expected count (see resetTriggersForHandler()
+ * for why routine replacement doesn't count).
+ */
 function writeCalendarChangeTriggers(force) {
   if (!force && isBootstrapActive()) {
     log('writeCalendarChangeTriggers: skipped — a large-setup import has these paused on purpose.');
-    return 0;
+    return { removed: 0, created: 0 };
   }
-  const existingTriggers = ScriptApp.getProjectTriggers();
-  const existingCalendarTriggerSources = existingTriggers
-    .filter(t => t.getHandlerFunction() === 'onCalendarChange')
-    .map(t => t.getTriggerSourceId());
 
-  let created = 0;
+  const existing = ScriptApp.getProjectTriggers().filter(t => t.getHandlerFunction() === 'onCalendarChange');
+  existing.forEach(t => ScriptApp.deleteTrigger(t));
+  const expected = Object.keys(CALENDAR_MAP).length;
+  const excess = Math.max(existing.length - expected, 0);
+  if (excess > 0) {
+    log(`⚠️ Found ${existing.length} calendar-edit triggers (expected ${expected}, one per location) — removed all of them before rebuilding.`);
+  }
+
   Object.keys(CALENDAR_MAP).forEach(calendarId => {
-    if (existingCalendarTriggerSources.indexOf(calendarId) === -1) {
-      ScriptApp.newTrigger('onCalendarChange').forUserCalendar(calendarId).onEventUpdated().create();
-      created++;
-      log(`Created calendar-edit trigger for "${CALENDAR_MAP[calendarId]}".`);
-    } else {
-      log(`Calendar-edit trigger for "${CALENDAR_MAP[calendarId]}" already exists — skipping.`);
-    }
+    ScriptApp.newTrigger('onCalendarChange').forUserCalendar(calendarId).onEventUpdated().create();
+    log(`Created calendar-edit trigger for "${CALENDAR_MAP[calendarId]}".`);
   });
-  return created;
+  return { removed: excess, created: expected };
 }
 
 /**
