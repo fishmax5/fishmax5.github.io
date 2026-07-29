@@ -18,6 +18,42 @@ the spreadsheet fills itself in.
 
 Everything runs on a schedule. You rarely need to press anything.
 
+> **Setting this up for the first time — or on a calendar with a lot already
+> on it?** Use **Import Everything (First Run)** in the menu instead of
+> **Sync Cal**. See [First run](#first-run) below.
+
+---
+
+## First run
+
+The very first import is the one genuinely big job this system ever does: it
+has to build a registration form for **every program on every calendar**, and
+write a link into **every event**. That is far more than Google gives a script
+in a single run, so pressing **Sync Cal** on a busy calendar times out
+part-way — and a timed-out sync leaves things half-done: triggers switched off,
+some programs imported, and forms it had just created forgotten (so a second
+attempt makes duplicates).
+
+**Import Everything (First Run)** exists for exactly this:
+
+- It **pauses all automation** first, so nothing else runs while it works.
+- It imports in **batches across several background runs**, a few minutes
+  apart. The first batch happens while you watch; the rest carry on by
+  themselves. Nothing is lost if a batch is cut short — the next one picks up
+  where it left off.
+- Programs whose events **already carry a registration link** keep their
+  existing form; it isn't replaced.
+- When it's done it **rebuilds every trigger**, redraws the dashboard, and
+  toasts a summary.
+
+Press it once and let it run — expect a few minutes for a small calendar and
+up to half an hour for a big one, and watch rows appear on
+**Master_Program_Dashboard** as it goes. Pressing it again is harmless:
+anything already imported is skipped, which also makes it the way to recover
+if an import was interrupted. When it finishes, run **Sync Registrations** (or
+just wait for the hourly run) to pull in responses to any forms that already
+existed.
+
 ---
 
 ## Setting up your calendar events
@@ -284,6 +320,7 @@ Under **🗓️ Calendar & Form Manager** at the top of the spreadsheet:
 | **Sync Cal** | Reads the calendars, creates/updates forms |
 | **Sync Registrations** | Pulls in new form responses, recomputes everything |
 | **Check Triggers** | Makes sure the automatic schedule is in place |
+| **Import Everything (First Run)** | The batched first import — see [First run](#first-run) |
 | **Resize All Sheets** | Tidies column widths only — safe any time |
 
 You normally don't need these. Automatically:
@@ -391,6 +428,20 @@ so a big backlog may take a few passes. To force every form to be re-checked
 (after hand-editing one, say), ask your developer to run
 `recheckAllRegistrationForms()` from the Apps Script editor.
 
+**Sync Cal ran for ages and then stopped / "Exceeded maximum execution time"**
+That's the first-import problem — too many forms to build in one run. Press
+**Import Everything (First Run)** instead; it does the same work in batches and
+skips whatever already came through. Then press **Check Triggers** to be sure
+the schedule is back (the batched import does that itself at the end).
+
+**"Import Everything" seems stuck**
+Look at **Master_Program_Dashboard** — if rows are still appearing every few
+minutes, it's working. It gives up on its own if two batches in a row make no
+progress, and tells you so. To stop it by hand, ask your developer to run
+`cancelBootstrapCalendars()` from the Apps Script editor; that restores every
+trigger and keeps whatever was already imported.
+
 **Nothing is syncing at all**
-Run **Check Triggers**. If that doesn't help, the script may need to be
-re-authorized from the Apps Script editor.
+Run **Check Triggers** — that rebuilds anything missing, including automation
+a first-run import paused and never got to restore. If that doesn't help, the
+script may need to be re-authorized from the Apps Script editor.

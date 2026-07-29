@@ -139,6 +139,16 @@
  *      A grid column whose guest name was left blank is ignored at parse
  *      time, so the pre-checked columns for guests you didn't bring cost
  *      nothing.
+ *    - THE FIRST IMPORT IS A SLICED JOB, NOT A SYNC. syncCalendars() is cheap
+ *      only because it normally has nothing to do. Importing a real calendar
+ *      from scratch — a form per program, a description write per event —
+ *      does not fit in one six-minute execution, and a timeout there is
+ *      destructive: no `finally` runs, so the calendar triggers stay removed
+ *      and the persistent form registry never gets flushed (which duplicates
+ *      forms on the next attempt). bootstrapCalendars() (section 4b) pauses
+ *      every trigger, imports in budgeted slices that hand off to each other
+ *      via one-off triggers, and rebuilds the triggers only when it's done.
+ *      syncCalendars()/syncRegistrations() stand down while it runs.
  *    - LIVE FORMS ARE MIGRATED, NOT JUST THE TEMPLATE. A group's form is
  *      created once and reused for as long as the group runs, so bumping
  *      TEMPLATE_VERSION only ever fixed forms created afterward — everyone
@@ -242,11 +252,18 @@
  *       (the Advanced Service — this is required for the incremental
  *       calendar-edit sync in section 3b; without it, onCalendarChange()
  *       will fail with "Calendar is not defined").
- *    3. Run initSheet() once (from the editor, or via the menu) to build all
- *       tabs, formatting, AND the triggers.
+ *    3. Run initSheet() once (from the editor) to build all tabs, formatting,
+ *       AND the triggers.
  *    4. Fill in the Lunch_Schedule tab (now one row per date PER LOCATION)
  *       and Config's Meal Buffer Amounts + Order Ahead Time.
  *    5. Reload the sheet to see the "🗓️ Calendar & Form Manager" menu.
+ *    6. FIRST IMPORT: use "Import Everything (First Run)" in that menu
+ *       (bootstrapCalendars()), NOT "Sync Cal". The first import has to
+ *       build a form for every program on every calendar, which is far more
+ *       than one Apps Script execution can do — the bootstrap slices it
+ *       across as many runs as it takes and pauses every trigger until it's
+ *       finished. See section 4b. initializeAndSyncAll() does steps 3 and 6
+ *       in one go.
  * ============================================================================
  */
 
@@ -2397,11 +2414,15 @@ function computeOrderAheadFlag(eventDate, submittedAt, orderAheadDays) {
 /**
  * Deliberately small: the three things anyone needs day to day, plus
  * Resize All Sheets, which is safe to click at any time (it only touches
- * column widths — no data, no formatting, no forms). The setup entry
- * points — initSheet() (rebuild every tab + formatting) and
- * initializeAndSyncAll() — are still here and still work; they're just run
- * from the Apps Script editor now rather than sitting in a menu where a
- * mis-click reformats the whole workbook.
+ * column widths — no data, no formatting, no forms), plus the first-run
+ * import. The setup entry points — initSheet() (rebuild every tab +
+ * formatting) and initializeAndSyncAll() — are still here and still work;
+ * they're just run from the Apps Script editor now rather than sitting in a
+ * menu where a mis-click reformats the whole workbook.
+ *
+ * "Import Everything (First Run)" is in the menu because it's the one thing
+ * a new workbook genuinely needs and the one thing Sync Cal cannot do in a
+ * single execution on a busy calendar — see section 4b.
  */
 function onOpen() {
   SpreadsheetApp.getUi()
@@ -2410,16 +2431,23 @@ function onOpen() {
     .addItem('Sync Registrations', 'syncRegistrations')
     .addItem('Check Triggers', 'writeTriggers')
     .addSeparator()
+    .addItem('Import Everything (First Run)', BOOTSTRAP_ENTRY_NAME)
     .addItem('Resize All Sheets', 'resizeAllSheets')
     .addToUi();
 }
 
+/**
+ * Full setup from nothing. The calendar half runs as a sliced bootstrap
+ * rather than a single syncCalendars(), because on a real calendar the first
+ * import is far too much work for one execution — see section 4b.
+ * bootstrapCalendars() returns as soon as its first slice is done and
+ * finishes itself in the background, restoring every trigger (including the
+ * hourly registration sync, which then imports any existing responses).
+ */
 function initializeAndSyncAll() {
   initSheet();
-  syncCalendars();
-  syncRegistrations();
-  SpreadsheetApp.getActiveSpreadsheet().toast('Initialize + full sync complete ✅', 'Calendar & Form Manager', 5);
-  log('initializeAndSyncAll complete.');
+  bootstrapCalendars();
+  log('initializeAndSyncAll: setup done; the calendar import continues in the background.');
 }
 
 /**
@@ -2456,7 +2484,7 @@ function writeTriggers() {
   const message = created > 0
     ? `Created ${created} missing trigger(s) ✅`
     : 'All triggers already in place ✅';
-  SpreadsheetApp.getActiveSpreadsheet().toast(message, 'Calendar & Form Manager', 5);
+  toastIfPossible(message); // also called from a trigger run, where there's no UI
   log(`writeTriggers complete: ${message}`);
 }
 
@@ -2894,6 +2922,10 @@ function resolveEventSettings(event, parsedTitle) {
 
 /** Public entry point: acquires a script lock so overlapping executions can't race each other. */
 function syncCalendars() {
+  if (isBootstrapActive()) {
+    log(`syncCalendars: a large-setup import (${BOOTSTRAP_ENTRY_NAME}()) is in progress — skipping this run so the two don't fight over the same forms.`);
+    return;
+  }
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(SYNC_LOCK_WAIT_MS)) {
     log('syncCalendars: another sync is already running — skipping this run.');
@@ -2911,105 +2943,209 @@ function syncCalendarsInternal() {
   try {
     const ss = SpreadsheetApp.getActiveSpreadsheet();
     const registrySheet = getOrCreateSheet(ss, SHEET_NAMES.PROGRAM_DASHBOARD);
-    const { start, end } = computeSyncDateRange();
-    log(`syncCalendars window: ${start} -> ${end}`);
 
     if (findProgramSessionHeaderRows(registrySheet).length === 0) {
       renderProgramDashboard();
     }
 
-    const existingState = getExistingRegistryState(registrySheet);
-    const eventsByCalendar = getCalendarEventsForWindow(start, end);
-
-    Object.keys(CALENDAR_MAP).forEach(calendarId => {
-      const locationName = CALENDAR_MAP[calendarId];
-      const events = eventsByCalendar[calendarId];
-      if (!events) {
-        log(`⚠️ Calendar not found or inaccessible: ${calendarId}`);
-        return;
-      }
-
-      const tentativeTitles = new Set();
-      const parsedEvents = events
-        .filter(ev => !ev.isAllDayEvent())
-        .map(ev => {
-          const parsed = parseEventTitle(ev.getTitle());
-          if (!parsed) return null;
-          // Tentative events are skipped WHOLESALE — no form, no registry
-          // row — until the leading "*" comes off. Because parseEventTitle()
-          // strips the asterisk from cleanTitle, confirming an event later
-          // produces the exact same Event_ID, so it simply flows through as
-          // a brand-new session with no reconciliation needed.
-          if (parsed.isTentative) {
-            tentativeTitles.add(parsed.cleanTitle);
-            return null;
-          }
-          const settings = resolveEventSettings(ev, parsed);
-          parsed.capacity = settings.capacity;
-          parsed.isFixed = settings.isFixed;
-          return { ev, parsed };
-        })
-        .filter(Boolean);
-
-      if (tentativeTitles.size > 0) {
-        log(`Skipped ${tentativeTitles.size} tentative program(s) at ${locationName} (title starts with "*"): ` +
-          `${Array.from(tentativeTitles).join(', ')}. Remove the asterisk to generate forms.`);
-      }
-
-      const groups = buildEventGroups(parsedEvents, calendarId);
-      const configInfo = { footerNote: getFormFooterForLocation(locationName) };
-
-      groups.forEach(group => {
-        const newEvents = group.events.filter(ev => {
-          const eventId = computeEventId(calendarId, group.cleanTitle, formatDateKey(ev.getStartTime()));
-          return !existingState.eventIds.has(eventId);
-        });
-
-        if (newEvents.length === 0) {
-          log(`No new dates for "${group.groupKey}" — already up to date, skipping.`);
-          return;
-        }
-
-        let existingFormId = existingState.groupFormMap[group.groupKey];
-        if (!existingFormId) {
-          existingFormId = findExistingFormIdFromEvents(group.events);
-          if (existingFormId) {
-            log(`Recovered existing form ${existingFormId} for "${group.groupKey}" from a calendar event description.`);
-          }
-        }
-
-        let formInfo;
-        if (existingFormId) {
-          try {
-            formInfo = refreshFormForNewDates(existingFormId, group, locationName, configInfo);
-            log(`Reused existing form for "${group.groupKey}"; added ${newEvents.length} new date(s).`);
-          } catch (err) {
-            log(`⚠️ Could not reopen existing form ${existingFormId} for "${group.groupKey}" (${err}) — creating a replacement form.`);
-            formInfo = createRegistrationForm(group, locationName, configInfo);
-          }
-        } else {
-          formInfo = createRegistrationForm(group, locationName, configInfo);
-          log(`Created new form for "${group.groupKey}" with ${newEvents.length} date(s).`);
-        }
-        savePersistentFormRegistryEntry(group.groupKey, formInfo.formId);
-
-        const newEventsGroup = Object.assign({}, group, { events: newEvents });
-        writeEventRegistryRows(registrySheet, newEventsGroup, locationName, formInfo);
-
-        backInjectCalendarDescriptions(group, formInfo);
-      });
-    });
-
-    flushPersistentRegistries(); // one write covering every group touched above
-
+    const summary = importCalendarGroups(registrySheet);
     renderProgramDashboard();
 
-    SpreadsheetApp.getActiveSpreadsheet().toast('Calendar sync complete ✅', 'Calendar & Form Manager', 5);
+    SpreadsheetApp.getActiveSpreadsheet().toast(
+      `Calendar sync complete ✅ (${describeImportSummary(summary)})`, 'Calendar & Form Manager', 5);
   } finally {
     flushPersistentRegistries(); // never strand a form-label fingerprint written during this run
     flushAdminDigest('Calendar sync');
     writeCalendarChangeTriggers();
   }
+}
+
+/**
+ * THE calendar->registry import, shared by syncCalendarsInternal() and the
+ * batched bootstrapCalendars(). Walks every group that has dates not already
+ * on the session table, gives each one a form (new, reused, or recovered from
+ * an event description), writes its rows, and stamps the registration link
+ * back onto its calendar events.
+ *
+ * options.deadline — epoch ms. Checked BETWEEN groups: the loop stops cleanly
+ *   the moment it can no longer be confident a whole group fits in what's
+ *   left of the execution. A group is the unit of work because its rows, its
+ *   form and its calendar-description edits have to land together; stopping
+ *   mid-group would leave a form with no rows pointing at it.
+ * options.onGroupDone — called after each processed group, for progress logs.
+ *
+ * Returns a summary including `remaining` (groups still needing work when the
+ * deadline hit) and `outOfTime`.
+ */
+function importCalendarGroups(registrySheet, options) {
+  options = options || {};
+  const { start, end } = computeSyncDateRange();
+  log(`Calendar import window: ${start} -> ${end}`);
+
+  const existingState = getExistingRegistryState(registrySheet);
+  const eventsByCalendar = getCalendarEventsForWindow(start, end);
+  const work = collectCalendarWork(eventsByCalendar, existingState);
+
+  const summary = {
+    groupsTotal: work.length, groupsProcessed: 0, groupsFailed: 0,
+    formsCreated: 0, formsReused: 0, eventsAdded: 0, remaining: 0, outOfTime: false
+  };
+
+  for (let i = 0; i < work.length; i++) {
+    if (options.deadline && Date.now() >= options.deadline) {
+      summary.outOfTime = true;
+      summary.remaining = work.length - i;
+      log(`Out of time for this run — ${summary.remaining} group(s) left to import.`);
+      break;
+    }
+
+    const item = work[i];
+    try {
+      const result = processCalendarGroup(registrySheet, item, existingState);
+      summary.groupsProcessed++;
+      summary.eventsAdded += result.eventsAdded;
+      if (result.formCreated) summary.formsCreated++; else summary.formsReused++;
+    } catch (err) {
+      // One bad group must not cost the whole run — especially mid-bootstrap,
+      // where everything after it would be stranded too.
+      summary.groupsFailed++;
+      log(`⚠️ Could not import "${item.group.groupKey}" (${err}) — continuing with the rest.`);
+      noteForAdmin('Programs that could not be imported',
+        `${item.group.cleanTitle} (${item.locationName}) — ${err}`);
+    }
+    if (options.onGroupDone) options.onGroupDone(summary);
+  }
+
+  flushPersistentRegistries(); // one write covering every group touched above
+  return summary;
+}
+
+/** Human-readable one-liner for a toast/log line. */
+function describeImportSummary(summary) {
+  const parts = [`${summary.groupsProcessed} program group(s)`, `${summary.eventsAdded} new date(s)`];
+  if (summary.formsCreated > 0) parts.push(`${summary.formsCreated} new form(s)`);
+  if (summary.formsReused > 0) parts.push(`${summary.formsReused} existing form(s) reused`);
+  if (summary.groupsFailed > 0) parts.push(`${summary.groupsFailed} failed`);
+  return parts.join(', ');
+}
+
+/**
+ * Turns the raw calendar fetch into an ordered list of units of work —
+ * `{ group, locationName, configInfo, newEvents }` — skipping groups whose
+ * dates are all already on the session table. Pure in-memory work: no form,
+ * sheet or calendar writes happen here, so a caller can safely build the
+ * whole list up front and then process as much of it as it has time for.
+ */
+function collectCalendarWork(eventsByCalendar, existingState) {
+  const work = [];
+
+  Object.keys(CALENDAR_MAP).forEach(calendarId => {
+    const locationName = CALENDAR_MAP[calendarId];
+    const events = eventsByCalendar[calendarId];
+    if (!events) {
+      log(`⚠️ Calendar not found or inaccessible: ${calendarId}`);
+      return;
+    }
+
+    const tentativeTitles = new Set();
+    const parsedEvents = events
+      .filter(ev => !ev.isAllDayEvent())
+      .map(ev => {
+        const parsed = parseEventTitle(ev.getTitle());
+        if (!parsed) return null;
+        // Tentative events are skipped WHOLESALE — no form, no registry
+        // row — until the leading "*" comes off. Because parseEventTitle()
+        // strips the asterisk from cleanTitle, confirming an event later
+        // produces the exact same Event_ID, so it simply flows through as
+        // a brand-new session with no reconciliation needed.
+        if (parsed.isTentative) {
+          tentativeTitles.add(parsed.cleanTitle);
+          return null;
+        }
+        const settings = resolveEventSettings(ev, parsed);
+        parsed.capacity = settings.capacity;
+        parsed.isFixed = settings.isFixed;
+        return { ev, parsed };
+      })
+      .filter(Boolean);
+
+    if (tentativeTitles.size > 0) {
+      log(`Skipped ${tentativeTitles.size} tentative program(s) at ${locationName} (title starts with "*"): ` +
+        `${Array.from(tentativeTitles).join(', ')}. Remove the asterisk to generate forms.`);
+    }
+
+    const configInfo = { footerNote: getFormFooterForLocation(locationName) };
+
+    buildEventGroups(parsedEvents, calendarId).forEach(group => {
+      const newEvents = group.events.filter(ev => {
+        const eventId = computeEventId(calendarId, group.cleanTitle, formatDateKey(ev.getStartTime()));
+        return !existingState.eventIds.has(eventId);
+      });
+      if (newEvents.length === 0) {
+        log(`No new dates for "${group.groupKey}" — already up to date, skipping.`);
+        return;
+      }
+      work.push({ group, locationName, configInfo, newEvents });
+    });
+  });
+
+  return work;
+}
+
+/**
+ * One unit of work: resolve the group's form, write its new session rows, and
+ * put the registration link on its calendar events. Returns
+ * { formCreated, eventsAdded }.
+ */
+function processCalendarGroup(registrySheet, item, existingState) {
+  const { group, locationName, configInfo, newEvents } = item;
+
+  let existingFormId = existingState.groupFormMap[group.groupKey];
+  if (!existingFormId) {
+    existingFormId = findExistingFormIdFromEvents(group.events);
+    if (existingFormId) {
+      log(`Recovered existing form ${existingFormId} for "${group.groupKey}" from a calendar event description.`);
+    }
+  }
+
+  let formInfo;
+  let formCreated = false;
+  if (existingFormId) {
+    try {
+      formInfo = refreshFormForNewDates(existingFormId, group, locationName, configInfo);
+      log(`Reused existing form for "${group.groupKey}"; added ${newEvents.length} new date(s).`);
+    } catch (err) {
+      log(`⚠️ Could not reopen existing form ${existingFormId} for "${group.groupKey}" (${err}) — creating a replacement form.`);
+      formInfo = createRegistrationForm(group, locationName, configInfo);
+      formCreated = true;
+    }
+  } else {
+    formInfo = createRegistrationForm(group, locationName, configInfo);
+    formCreated = true;
+    log(`Created new form for "${group.groupKey}" with ${newEvents.length} date(s).`);
+  }
+  savePersistentFormRegistryEntry(group.groupKey, formInfo.formId);
+  // Flushed HERE, not at the end of the run: between creating a form and
+  // writing its rows there is a window where nothing durable points at it,
+  // and an execution killed in that window would create a second form for
+  // this group on the next attempt. One property write per new group is a
+  // cheap price for that never happening. (Everything after this point is
+  // itself durable — the rows carry Form_ID, and so does the event
+  // description.)
+  flushPersistentRegistries();
+
+  const newEventsGroup = Object.assign({}, group, { events: newEvents });
+  writeEventRegistryRows(registrySheet, newEventsGroup, locationName, formInfo);
+
+  backInjectCalendarDescriptions(group, formInfo);
+
+  // Keep the in-memory state honest for the rest of THIS run: these dates now
+  // exist, and this group now has a form.
+  newEvents.forEach(ev => existingState.eventIds.add(
+    computeEventId(group.calendarId, group.cleanTitle, formatDateKey(ev.getStartTime()))));
+  existingState.groupFormMap[group.groupKey] = formInfo.formId;
+
+  return { formCreated, eventsAdded: newEvents.length };
 }
 
 /** Groups parsed calendar events into Fixed-series or monthly-chunk buckets. */
@@ -3085,6 +3221,309 @@ function getExistingRegistryState(registrySheet) {
   });
 
   return state;
+}
+
+
+// ============================================================================
+// 4b. LARGE-SETUP BOOTSTRAP  (bootstrapCalendars / resumeBootstrapCalendars)
+// ============================================================================
+//
+// WHY THIS EXISTS: a normal syncCalendars() finishes in seconds because it has
+// almost nothing to do — every group already has its form and its rows, so it
+// skips them. The FIRST import is the opposite: every group is new, and each
+// one costs a Drive copy, a dozen-plus Forms calls, a sheet write and one
+// calendar-description write PER EVENT. Multiply that by a full 60-day window
+// of programs across three calendars and it blows straight through Apps
+// Script's six-minute execution limit — which is exactly what happens when
+// you run initSheet() and then Sync Cal on a real calendar.
+//
+// A timeout there is worse than slow. The kill is not an exception, so
+// syncCalendarsInternal()'s `finally` never runs: the calendar-edit triggers
+// it removed at the start stay removed, the persistent registries never get
+// flushed (so the forms it just created are forgotten and DUPLICATED on the
+// next attempt), and whatever it managed to write is half-applied.
+//
+// So the bootstrap works in slices:
+//   - Automation is paused up front — the calendar-edit triggers AND the
+//     time-driven syncCalendars/syncRegistrations triggers — so nothing else
+//     runs while a multi-execution import is in flight. syncCalendars() also
+//     refuses to start on its own while the bootstrap is active.
+//   - Each slice imports whole groups until its time budget runs out, then
+//     hands off to the next slice via a one-off trigger. Progress lives in
+//     the SHEET (a group with rows is skipped next time), so a slice never
+//     has to trust anything it kept in memory.
+//   - The hand-off trigger is armed BEFORE the work starts, timed to fire
+//     after this slice's budget. If a slice is killed anyway, the next one
+//     still comes. A slice that finishes normally re-arms it for a minute
+//     out, so the common case doesn't idle.
+//   - The final slice rebuilds every trigger, renders the dashboard once,
+//     and clears the state.
+// ============================================================================
+
+const BOOTSTRAP_ENTRY_NAME = 'bootstrapCalendars';
+const BOOTSTRAP_RESUME_HANDLER = 'resumeBootstrapCalendars';
+const BOOTSTRAP_STATE_PROP_KEY = 'BOOTSTRAP_STATE_V1';
+
+/**
+ * How long one slice may spend importing before it stops between groups.
+ * Apps Script's ceiling is 6 minutes for consumer accounts; the gap is
+ * headroom for the group in flight plus the wrap-up (flush, re-arm, log).
+ */
+const BOOTSTRAP_SLICE_BUDGET_MS = 3.5 * 60 * 1000;
+/** Gap before the next slice after a clean hand-off. */
+const BOOTSTRAP_RESUME_DELAY_MS = 60 * 1000;
+/** Watchdog: armed before a slice starts, so a slice killed by the timeout still gets a successor. */
+const BOOTSTRAP_WATCHDOG_DELAY_MS = BOOTSTRAP_SLICE_BUDGET_MS + 2.5 * 60 * 1000;
+/** Hard stop, so a bug can never leave the project trading triggers forever. */
+const BOOTSTRAP_MAX_SLICES = 30;
+/** Consecutive slices allowed to make no progress before giving up. */
+const BOOTSTRAP_MAX_STALLED_SLICES = 2;
+/**
+ * After this long with no slice completing, isBootstrapActive() stops
+ * believing the state — otherwise a bootstrap that died in a way that took
+ * its watchdog with it would block every normal sync indefinitely.
+ */
+const BOOTSTRAP_STALE_MS = 2 * 60 * 60 * 1000;
+
+function getBootstrapState() {
+  const raw = PropertiesService.getScriptProperties().getProperty(BOOTSTRAP_STATE_PROP_KEY);
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch (err) {
+    log(`⚠️ Bootstrap state was unreadable (${err}) — treating it as finished.`);
+    return null;
+  }
+}
+
+function saveBootstrapState(state) {
+  PropertiesService.getScriptProperties().setProperty(BOOTSTRAP_STATE_PROP_KEY, JSON.stringify(state));
+}
+
+function clearBootstrapState() {
+  PropertiesService.getScriptProperties().deleteProperty(BOOTSTRAP_STATE_PROP_KEY);
+}
+
+/** Is a sliced import in flight right now? Stale state (see BOOTSTRAP_STALE_MS) reads as "no". */
+function isBootstrapActive() {
+  const state = getBootstrapState();
+  if (!state) return false;
+  const age = Date.now() - (state.lastSliceAt || state.startedAt || 0);
+  if (age > BOOTSTRAP_STALE_MS) {
+    log(`⚠️ Ignoring a large-setup import that hasn't advanced in ${Math.round(age / 60000)} minute(s) — ` +
+      `run ${BOOTSTRAP_ENTRY_NAME}() to restart it, or cancelBootstrapCalendars() to clear it.`);
+    return false;
+  }
+  return true;
+}
+
+/**
+ * START HERE for a big calendar. Imports every program on every calendar —
+ * creating each one's registration form, or adopting the form already linked
+ * from its calendar description — across as many executions as it takes,
+ * with all automation paused until it's done.
+ *
+ * Safe to run on an already-populated workbook: groups whose dates are
+ * already on the session table are skipped, so this is also the way to
+ * recover after a sync that timed out half-finished.
+ */
+function bootstrapCalendars() {
+  if (isBootstrapActive()) {
+    const state = getBootstrapState();
+    const message = `A large-setup import is already running (slice ${state.slices} of at most ${BOOTSTRAP_MAX_SLICES}) — leaving it alone.`;
+    log(message);
+    toastIfPossible(message);
+    return;
+  }
+
+  pauseAutomationForBootstrap();
+  saveBootstrapState({
+    startedAt: Date.now(), lastSliceAt: Date.now(), slices: 0, stalledSlices: 0,
+    lastRemaining: null, groupsProcessed: 0, eventsAdded: 0,
+    formsCreated: 0, formsReused: 0, groupsFailed: 0
+  });
+  log('Large-setup import started: automation paused, importing in slices.');
+  toastIfPossible('Large-setup import started — this runs in the background and may take several minutes.');
+
+  runBootstrapSlice();
+}
+
+/** Trigger handler for the next slice. Never call this directly — use bootstrapCalendars(). */
+function resumeBootstrapCalendars() {
+  runBootstrapSlice();
+}
+
+/**
+ * One execution's worth of importing. Everything that decides whether there
+ * is a NEXT slice happens here.
+ */
+function runBootstrapSlice() {
+  const state = getBootstrapState();
+  if (!state) {
+    // Nothing in flight — a leftover trigger firing after the job finished.
+    deleteBootstrapResumeTriggers();
+    return;
+  }
+
+  // Armed BEFORE anything else, including the lock: from here on every exit
+  // path leaves exactly one live successor behind, so neither an outright
+  // kill nor a lock we couldn't get can strand the import. finishBootstrap()
+  // is what finally clears it.
+  armBootstrapResume(BOOTSTRAP_WATCHDOG_DELAY_MS);
+
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(SYNC_LOCK_WAIT_MS)) {
+    log('Bootstrap slice: another execution holds the lock — the next slice will retry.');
+    return;
+  }
+
+  try {
+    state.slices++;
+    state.lastSliceAt = Date.now();
+    saveBootstrapState(state);
+
+    if (state.slices > BOOTSTRAP_MAX_SLICES) {
+      finishBootstrap(state, `stopped after ${BOOTSTRAP_MAX_SLICES} slices without finishing`);
+      return;
+    }
+
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const registrySheet = getOrCreateSheet(ss, SHEET_NAMES.PROGRAM_DASHBOARD);
+    if (findProgramSessionHeaderRows(registrySheet).length === 0) {
+      renderProgramDashboard();
+    }
+
+    const summary = importCalendarGroups(registrySheet, { deadline: Date.now() + BOOTSTRAP_SLICE_BUDGET_MS });
+    state.groupsProcessed += summary.groupsProcessed;
+    state.eventsAdded += summary.eventsAdded;
+    state.formsCreated += summary.formsCreated;
+    state.formsReused += summary.formsReused;
+    state.groupsFailed += summary.groupsFailed;
+    log(`Bootstrap slice ${state.slices}: ${describeImportSummary(summary)}; ${summary.remaining} group(s) left.`);
+
+    if (!summary.outOfTime) {
+      finishBootstrap(state, null);
+      return;
+    }
+
+    // Still work to do. Guard against a group that can never succeed keeping
+    // this going forever: no forward movement twice running ends it.
+    const madeProgress = summary.groupsProcessed > 0 &&
+      (state.lastRemaining === null || summary.remaining < state.lastRemaining);
+    state.stalledSlices = madeProgress ? 0 : state.stalledSlices + 1;
+    state.lastRemaining = summary.remaining;
+    saveBootstrapState(state);
+
+    if (state.stalledSlices >= BOOTSTRAP_MAX_STALLED_SLICES) {
+      finishBootstrap(state, `stopped early — ${summary.remaining} group(s) could not be imported`);
+      return;
+    }
+
+    armBootstrapResume(BOOTSTRAP_RESUME_DELAY_MS); // replaces the watchdog with a prompt hand-off
+    log(`Bootstrap: handing off to the next slice in ${Math.round(BOOTSTRAP_RESUME_DELAY_MS / 1000)}s.`);
+  } catch (err) {
+    // An exception, unlike a timeout, is ours to handle: put the system back
+    // together rather than leaving automation paused.
+    log(`⚠️ Bootstrap slice failed (${err}) — restoring automation.`);
+    noteForAdmin('Large-setup import', `The import stopped with an error and automation was restored: ${err}`);
+    finishBootstrap(getBootstrapState() || state, `stopped by an error: ${err}`);
+  } finally {
+    flushPersistentRegistries(); // a killed slice's forms must never be forgotten
+    lock.releaseLock();
+  }
+}
+
+/**
+ * Last slice: one dashboard render for everything imported, every trigger
+ * back in place, state cleared. `problem` is null on a clean finish.
+ */
+function finishBootstrap(state, problem) {
+  state = state || {};
+  deleteBootstrapResumeTriggers();
+  clearBootstrapState();
+
+  try {
+    renderProgramDashboard(true);
+  } catch (err) {
+    log(`⚠️ Bootstrap: could not render the dashboard at the end (${err}) — the data is imported; re-run Sync Cal to redraw.`);
+  }
+
+  try {
+    writeTriggers(); // daily sync, hourly registrations, one calendar-edit trigger per calendar
+  } catch (err) {
+    // Automation staying paused is the one outcome worth shouting about.
+    log(`⚠️ Bootstrap: could not restore the triggers (${err}) — run "Check Triggers" from the menu.`);
+    noteForAdmin('Large-setup import',
+      `The import finished but its triggers could not be restored (${err}). Run "Check Triggers" from the menu.`);
+  }
+
+  const totals = `${state.groupsProcessed || 0} program group(s), ${state.eventsAdded || 0} date(s), ` +
+    `${state.formsCreated || 0} new form(s), ${state.formsReused || 0} existing form(s) reused` +
+    (state.groupsFailed > 0 ? `, ${state.groupsFailed} failed` : '');
+  const headline = problem
+    ? `⚠️ Large-setup import ${problem}. Imported so far: ${totals}.`
+    : `Large-setup import complete ✅ (${totals}, over ${state.slices || 1} run(s)).`;
+
+  log(headline);
+  if (problem) noteForAdmin('Large-setup import', headline);
+  toastIfPossible(headline);
+  flushAdminDigest('Large-setup import');
+  log('Automation restored. Run "Sync Registrations" (or wait for the hourly trigger) to pull in any existing form responses.');
+}
+
+/** Deletes the syncCalendars / syncRegistrations / onCalendarChange triggers for the duration of the import. */
+function pauseAutomationForBootstrap() {
+  const paused = ['syncCalendars', 'syncRegistrations', 'onCalendarChange'];
+  let removed = 0;
+  ScriptApp.getProjectTriggers().forEach(t => {
+    if (paused.indexOf(t.getHandlerFunction()) === -1) return;
+    ScriptApp.deleteTrigger(t);
+    removed++;
+  });
+  log(`Paused ${removed} trigger(s) for the duration of the import — finishBootstrap() puts them all back.`);
+  return removed;
+}
+
+/** Replaces any pending hand-off with exactly one, `delayMs` out. */
+function armBootstrapResume(delayMs) {
+  deleteBootstrapResumeTriggers();
+  ScriptApp.newTrigger(BOOTSTRAP_RESUME_HANDLER).timeBased().after(delayMs).create();
+}
+
+function deleteBootstrapResumeTriggers() {
+  let removed = 0;
+  ScriptApp.getProjectTriggers().forEach(t => {
+    if (t.getHandlerFunction() !== BOOTSTRAP_RESUME_HANDLER) return;
+    ScriptApp.deleteTrigger(t); // one-off triggers linger after firing; clear them out
+    removed++;
+  });
+  return removed;
+}
+
+/**
+ * ESCAPE HATCH — run from the Apps Script editor. Stops a sliced import and
+ * puts automation back exactly as finishBootstrap() would. Whatever was
+ * already imported stays imported; re-running bootstrapCalendars() picks up
+ * from there.
+ */
+function cancelBootstrapCalendars() {
+  const state = getBootstrapState();
+  if (!state) {
+    deleteBootstrapResumeTriggers();
+    writeTriggers();
+    log('No large-setup import was running — triggers verified anyway.');
+    return;
+  }
+  finishBootstrap(state, 'was cancelled');
+}
+
+/** Toasts when there's a UI to toast into (a trigger run has none) — never worth throwing over. */
+function toastIfPossible(message) {
+  try {
+    SpreadsheetApp.getActiveSpreadsheet().toast(message, 'Calendar & Form Manager', 8);
+  } catch (err) {
+    // Running from a trigger with no active spreadsheet UI — the log line stands on its own.
+  }
 }
 
 /**
@@ -3354,6 +3793,10 @@ function setLastSyncTime(date) {
 }
 
 function syncRegistrations() {
+  if (isBootstrapActive()) {
+    log(`syncRegistrations: a large-setup import (${BOOTSTRAP_ENTRY_NAME}()) is writing to the session table — skipping this run.`);
+    return;
+  }
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const registrySheet = getOrCreateSheet(ss, SHEET_NAMES.PROGRAM_DASHBOARD);
   const registrantsSheet = getOrCreateSheet(ss, SHEET_NAMES.LUNCH_EVENT_REGISTRANTS);
