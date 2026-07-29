@@ -547,6 +547,32 @@ const LUNCH_DASHBOARD_MANUAL_COLUMNS = [
   'Standard_Buffer', 'Tester_Buffer', 'Actual_Ordered', 'Day_1_In-Person', 'Day_1_Takeaway',
   'Subs_In-Person', 'Subs_Takeaway', 'Total_Consumed', 'Thrown_Away', 'Discrepancy'
 ];
+
+/**
+ * Nothing on the lunch dashboard is a machine-only key, so nothing is hidden
+ * today — the buffer/consumption columns were moved to the END of the row
+ * instead (see HEADERS.Master_Lunch_Dashboard), which keeps them reachable
+ * while getting them out from between the numbers staff actually order
+ * against. The constant exists so the decision has one place to live.
+ */
+const LUNCH_DASHBOARD_HIDDEN_COLUMNS = [];
+
+/**
+ * Master_Program_Dashboard: the session table is rebuilt from the calendar
+ * every render, so Type_Tag is the only cell a human can usefully change (and
+ * handleProgramDashboardEdit() makes it stick by writing it back to the
+ * calendar). Location is a dropdown for readability but is equally
+ * calendar-derived, so it is NOT advertised as editable.
+ */
+const PROGRAM_DASHBOARD_EDITABLE_COLUMNS = ['Type_Tag'];
+
+/**
+ * Internal plumbing on the program dashboard: the raw IDs and the duplicate
+ * link column. Form_Response_Link ("View Live Form") stays visible — it is the
+ * link staff actually hand out — while Edit_Form_Link and the bare Form_ID are
+ * for troubleshooting only.
+ */
+const PROGRAM_DASHBOARD_HIDDEN_COLUMNS = ['Form_ID', 'Event_ID', 'Calendar_Source', 'Calendar_Synced?'];
 const MANUAL_ENTRY_HEADER_COLOR = '#FFF2CC';
 const MANUAL_ENTRY_CELL_TINT = '#FFFCF0';
 /**
@@ -632,7 +658,9 @@ const SHEET_NAMES = {
   LUNCH_EVENT_REGISTRANTS: 'Lunch_and_Event_Registrants',
   LUNCH_DASHBOARD: 'Master_Lunch_Dashboard',
   LUNCH_SCHEDULE: 'Lunch_Schedule',
-  TRIAGE: 'Deleted_Event_Triage'
+  TRIAGE: 'Deleted_Event_Triage',
+  MEMBER_ROLL: 'Member_Roll',
+  PROGRAM_OPTIONS: 'Program_Options'
 };
 
 const LEGACY_ACTIVE_PROGRAMS_SHEET_NAME = 'Active_Programs';
@@ -663,16 +691,29 @@ const HEADERS = {
   // something staff read first; Party_Size (the headcount on that
   // submission) stays up front near the person since it IS worth reading at
   // a glance.
+  // Attended and Lunch_Served are the two DAY-OF columns: they're what staff
+  // tick on the day, and they sit immediately after Name so marking a row is
+  // one glance and one click, with no horizontal scrolling. Everything the
+  // form supplied (Lunch_Type, Party_Size, Form_Source...) follows behind
+  // them, and the internal keys trail at the end.
   Lunch_and_Event_Registrants: [
-    'Event_Date', 'Location', 'Event', 'Manual_Override', 'Name', 'Person_Type', 'Lunch_Type',
-    'Primary_Registrant', 'Party_Size', 'Form_Source', 'Program_Status', 'Lunch_Status',
-    'Order_Ahead_Flag', 'Admin_Notes', 'Event_ID', 'Party_ID'
+    'Event_Date', 'Location', 'Event', 'Name', 'Attended', 'Lunch_Served',
+    'Person_Type', 'Lunch_Type', 'Lunch_Status', 'Program_Status',
+    'Primary_Registrant', 'Party_Size', 'Order_Ahead_Flag', 'Admin_Notes',
+    'Manual_Override', 'Form_Source', 'Event_ID', 'Party_ID'
   ],
+  // Registered_Count (what the forms say) and Served_Confirmed (what was
+  // actually ticked off on the Registrants tab) sit side by side on purpose —
+  // planned versus real is the comparison this tab exists to support.
+  // The hand-entry buffer/consumption columns now trail at the END: they're
+  // reconciliation detail, and having them between the counts pushed the
+  // numbers staff actually order against off the screen.
   Master_Lunch_Dashboard: [
-    'Event_Date', 'Manual_Override', 'Location', 'Lunch_Type', 'Meal_Shorthand', 'Registered_Count',
-    'Total_to_Order', 'Actual_Ordered', 'Standard_Buffer', 'Tester_Buffer', 'Day_1_In-Person',
-    'Day_1_Takeaway', 'Subs_In-Person', 'Subs_Takeaway', 'Total_Consumed', 'Thrown_Away',
-    'Discrepancy'
+    'Event_Date', 'Location', 'Lunch_Type', 'Meal_Shorthand',
+    'Registered_Count', 'Served_Confirmed', 'Total_to_Order', 'Actual_Ordered',
+    'Standard_Buffer', 'Tester_Buffer', 'Day_1_In-Person', 'Day_1_Takeaway',
+    'Subs_In-Person', 'Subs_Takeaway', 'Total_Consumed', 'Thrown_Away',
+    'Discrepancy', 'Manual_Override'
   ],
   // Now one row per Event_Date PER LOCATION. Type includes "Not Serving"
   // (see CATERED_LUNCH_TYPES vs LUNCH_TYPE_OPTIONS below).
@@ -683,18 +724,52 @@ const HEADERS = {
   // array is what keeps every registrant column (Location/Event included)
   // landing in triage rows automatically, with no per-column wiring.
   Deleted_Event_Triage: [
-    'Event_Date', 'Location', 'Event', 'Manual_Override', 'Name', 'Person_Type', 'Lunch_Type',
-    'Primary_Registrant', 'Party_Size', 'Form_Source', 'Program_Status', 'Lunch_Status',
-    'Order_Ahead_Flag', 'Admin_Notes', 'Event_ID', 'Party_ID',
+    'Event_Date', 'Location', 'Event', 'Name', 'Attended', 'Lunch_Served',
+    'Person_Type', 'Lunch_Type', 'Lunch_Status', 'Program_Status',
+    'Primary_Registrant', 'Party_Size', 'Order_Ahead_Flag', 'Admin_Notes',
+    'Manual_Override', 'Form_Source', 'Event_ID', 'Party_ID',
     'Deleted_Event_Title', 'Deleted_Event_Location', 'Flagged_Date', 'Triage_Notes'
+  ],
+  /**
+   * Member_Roll — one row per unique PERSON ever seen on a form, with columns
+   * the system maintains and columns only staff write. The point is that a
+   * name typed into a registration form once becomes a known member with
+   * standing notes attached, instead of a string that has to be re-learned
+   * every time.
+   *
+   * Times_Seen/First_Seen/Last_Seen/Locations/Usual_Lunch are RECOMPUTED from
+   * the registrant history on every refresh; Usual_Guests, Dietary_Notes,
+   * Contact and Staff_Notes are never touched once written — see
+   * MEMBER_ROLL_STAFF_COLUMNS.
+   */
+  Member_Roll: [
+    'Name', 'Times_Seen', 'First_Seen', 'Last_Seen', 'Locations', 'Usual_Lunch',
+    'Usual_Guests', 'Dietary_Notes', 'Contact', 'Staff_Notes'
+  ],
+  /**
+   * Program_Options — one row per unique PROGRAM (Clean_Title x Location),
+   * same split: the left columns are recomputed, the right columns are the
+   * staff's own standing notes about how that program actually runs.
+   */
+  Program_Options: [
+    'Event', 'Location', 'Type_Tag', 'Sessions_Tracked', 'Next_Date', 'Last_Date',
+    'Typical_Attendance', 'Usual_Capacity', 'Room_Or_Setup', 'Staff_Notes'
   ]
 };
+
+/** Member_Roll columns the refresh must never overwrite — the staff's own knowledge. */
+const MEMBER_ROLL_STAFF_COLUMNS = ['Usual_Guests', 'Dietary_Notes', 'Contact', 'Staff_Notes'];
+/** Program_Options columns the refresh must never overwrite. */
+const PROGRAM_OPTIONS_STAFF_COLUMNS = ['Typical_Attendance', 'Usual_Capacity', 'Room_Or_Setup', 'Staff_Notes'];
+
+/** Day-of columns on Registrants that staff tick by hand. TRUE/FALSE checkboxes. */
+const REGISTRANT_DAYOF_COLUMNS = ['Attended', 'Lunch_Served'];
 
 /** Headers for the small "Today at Each Location" section (A) inside Master_Program_Dashboard. */
 const TODAY_AT_LOCATIONS_HEADERS = ['Location', 'Programs Today', 'Sessions Today', 'Registered Today'];
 
 /** Headers for Master_Lunch_Dashboard's "Today's Lunch Needs" block — its own short list. */
-const TODAY_LUNCH_HEADERS = ['Location', 'Lunch_Type', 'Meal_Shorthand', 'Registered_Count', 'Total_to_Order'];
+const TODAY_LUNCH_HEADERS = ['Location', 'Lunch_Type', 'Meal_Shorthand', 'Registered_Count', 'Served_Confirmed', 'Total_to_Order'];
 
 /** Zero-based { header: index } map for a plain headers array (not a sheet). */
 function getIndexMap(headersArray) {
@@ -2117,11 +2192,12 @@ function initSheet() {
   initPlaceholderSheet(ss, SHEET_NAMES.LUNCH_DASHBOARD, 'Run "Sync Registrations" from the menu to populate this dashboard.');
 
   renderProgramDashboard(true);
+  refreshMemoryTabs(null, null); // builds Member_Roll / Program_Options, empty on a fresh workbook
 
   writeTriggers();
   reorderTabs(ss);
 
-  SpreadsheetApp.getActiveSpreadsheet().toast('Sheet setup complete ✅', 'Calendar & Form Manager', 5);
+  toastIfPossible('Sheet setup complete ✅ — next: "Import Everything (First Run)".');
   log('initSheet complete.');
 }
 
@@ -2148,6 +2224,8 @@ function reorderTabs(ss) {
     SHEET_NAMES.LUNCH_DASHBOARD,
     SHEET_NAMES.LUNCH_EVENT_REGISTRANTS,
     SHEET_NAMES.LUNCH_SCHEDULE,
+    SHEET_NAMES.MEMBER_ROLL,
+    SHEET_NAMES.PROGRAM_OPTIONS,
     SHEET_NAMES.CONFIG,
     SHEET_NAMES.TRIAGE
   ];
@@ -2185,21 +2263,71 @@ function styleHeaderRow(sheet, numCols) {
     .setWrapStrategy(SpreadsheetApp.WrapStrategy.CLIP);
 }
 
-/** Writes a merged, colored section banner at an arbitrary row. */
-function writeSectionBanner(sheet, row, numCols, text) {
+/**
+ * ONE type scale for the whole workbook. Every tab draws from this, so a
+ * "banner" looks like a banner everywhere and the eye learns the hierarchy
+ * once: big left-aligned blue banner = a section starts here; dark bold row =
+ * these are the columns; plain = data.
+ *
+ * Sizes, not just weights, do the work — bold-on-bold reads as noise, whereas
+ * a genuine size step is legible at a glance from across a desk, which is how
+ * this workbook actually gets used on a serving day.
+ */
+const TYPO = {
+  BANNER:        { size: 13, weight: 'bold', color: '#FFFFFF', background: '#3C78D8' },
+  BANNER_HERO:   { size: 18, weight: 'bold', color: '#FFFFFF', background: '#1155CC' },
+  COLUMN_HEADER: { size: 10, weight: 'bold', color: '#FFFFFF', background: '#434343' },
+  HERO_VALUE:    { size: 16, weight: 'bold', color: '#0B5394' },
+  HERO_LABEL:    { size: 11, weight: 'bold', color: '#434343' },
+  MUTED:         { size: 9,  weight: 'normal', color: '#666666' }
+};
+
+/** Row heights that go with the scale above. */
+const ROW_HEIGHTS = {
+  BANNER: 28,
+  BANNER_HERO: 40,
+  HERO_DATA: 34
+};
+
+/**
+ * Writes a merged section banner at an arbitrary row.
+ *
+ * LEFT-ALIGNED, deliberately: a banner is merged across the full width of the
+ * table, so centering puts its text in the middle of a very wide strip —
+ * nowhere near the column-A edge the eye scans down. Left-aligned, every
+ * banner starts on the same vertical line as the data beneath it and the tab
+ * reads as a stack of labelled blocks.
+ *
+ * `hero` gives the one banner per tab that should dominate (Today's Lunch
+ * Needs, Today at Each Location) a larger size, deeper blue and a taller row.
+ */
+function writeSectionBanner(sheet, row, numCols, text, options) {
+  options = options || {};
+  const style = options.hero ? TYPO.BANNER_HERO : TYPO.BANNER;
   const range = sheet.getRange(row, 1, 1, numCols);
   try { range.breakApart(); } catch (err) { /* not previously merged */ }
   range.merge()
     .setValue(text)
-    .setFontWeight('bold').setFontColor('#FFFFFF').setBackground('#6D9EEB')
-    .setHorizontalAlignment('center').setVerticalAlignment('middle')
+    .setFontSize(style.size)
+    .setFontWeight(style.weight)
+    .setFontColor(style.color)
+    .setBackground(style.background)
+    .setHorizontalAlignment('left')
+    .setVerticalAlignment('middle')
     .setWrapStrategy(SpreadsheetApp.WrapStrategy.CLIP);
+  try {
+    sheet.setRowHeight(row, options.hero ? ROW_HEIGHTS.BANNER_HERO : ROW_HEIGHTS.BANNER);
+  } catch (err) { /* row may not exist yet on a brand-new sheet */ }
 }
 
 /** Writes a bold, dark header row of the given headers at an arbitrary row. */
 function writeSectionHeader(sheet, row, numCols, headerValues) {
   sheet.getRange(row, 1, 1, numCols).setValues([headerValues])
-    .setFontWeight('bold').setBackground('#434343').setFontColor('#FFFFFF')
+    .setFontSize(TYPO.COLUMN_HEADER.size)
+    .setFontWeight(TYPO.COLUMN_HEADER.weight)
+    .setBackground(TYPO.COLUMN_HEADER.background)
+    .setFontColor(TYPO.COLUMN_HEADER.color)
+    .setVerticalAlignment('middle')
     .setWrapStrategy(SpreadsheetApp.WrapStrategy.CLIP);
 }
 
@@ -3061,32 +3189,86 @@ function autoFlipManualOverride(sheet, headerMap0Based, editedRow, editedCol1Bas
 
 /** Lunch_and_Event_Registrants: auto-flip on any hand-edit within a data zone, plus status-change toasts. */
 function handleRegistrantsEdit(e, sheet) {
-  const zones = getSectionZones(sheet, 'Event_ID');
   const editedRow = e.range.getRow();
+  const editedCol = e.range.getColumn();
+
+  // The Quick Mark panel sits ABOVE the data zones, so it has to be handled
+  // before the zone check below discards everything outside them.
+  if (editedRow === QUICK_MARK.inputRow) {
+    handleQuickMarkEdit(e, sheet, editedCol);
+    return;
+  }
+
+  const zones = getSectionZones(sheet, 'Event_ID');
   const zone = findZoneForRow(zones, editedRow);
   if (!zone) return;
 
   const headerMap = getLiveHeaderMap(sheet, zone.headerRow, HEADERS.Lunch_and_Event_Registrants);
-  const editedCol = e.range.getColumn();
   autoFlipManualOverride(sheet, headerMap, editedRow, editedCol);
 
   if (typeof e.value === 'undefined') return; // multi-cell paste, skip toast logic
 
   const isProgramStatusCol = editedCol === headerMap['Program_Status'] + 1;
   const isLunchStatusCol = editedCol === headerMap['Lunch_Status'] + 1;
+  const isLunchServedCol = headerMap['Lunch_Served'] !== undefined &&
+    editedCol === headerMap['Lunch_Served'] + 1;
+
+  // Ticking Lunch_Served directly on a row implies attendance, exactly as it
+  // does through the Quick Mark panel — one rule, wherever the tick happens.
+  if (isLunchServedCol && isTruthyCheckbox(e.value) && headerMap['Attended'] !== undefined) {
+    sheet.getRange(editedRow, headerMap['Attended'] + 1).setValue(true);
+    toastIfPossible('Lunch marked — attendance ticked too.');
+  }
 
   if ((isProgramStatusCol || isLunchStatusCol) && e.value === 'Cancelled') {
-    SpreadsheetApp.getActiveSpreadsheet().toast(
-      '⚠️ Alert: Registration cancelled! Please verify if this changes your catering order numbers.',
-      'Calendar & Form Manager', 6
-    );
+    toastIfPossible('⚠️ Registration cancelled — check whether this changes your catering numbers.');
   }
 
   if (isProgramStatusCol && e.oldValue === 'Waitlisted' && e.value === 'Active') {
-    SpreadsheetApp.getActiveSpreadsheet().toast(
-      "🚀 Promotion detected! Remember to update their Lunch Status from 'Waitlisted' to 'Needed' if they require a meal.",
-      'Calendar & Form Manager', 6
-    );
+    toastIfPossible("🚀 Promoted off the waitlist — set their Lunch_Status to 'Needed' if they want a meal.");
+  }
+}
+
+/**
+ * The Quick Mark panel's own edits: cascade the dropdowns as the selection
+ * narrows, and apply a tick to the real registrant row.
+ */
+function handleQuickMarkEdit(e, sheet, editedCol) {
+  if (editedCol === QUICK_MARK.LOCATION_COL) {
+    // A new location invalidates whatever program/name was chosen under the
+    // previous one — clearing them is what keeps an impossible combination
+    // from being submitted.
+    sheet.getRange(QUICK_MARK.inputRow, QUICK_MARK.EVENT_COL, 1, 2).clearContent();
+    const lists = refreshQuickMarkDropdowns(sheet, null);
+    setQuickMarkStatus(sheet, HEADERS.Lunch_and_Event_Registrants.length,
+      `${lists.programList.length} program(s) at this location — pick one, or go straight to a name.`);
+    return;
+  }
+
+  if (editedCol === QUICK_MARK.EVENT_COL) {
+    sheet.getRange(QUICK_MARK.inputRow, QUICK_MARK.NAME_COL).clearContent();
+    const lists = refreshQuickMarkDropdowns(sheet, null);
+    setQuickMarkStatus(sheet, HEADERS.Lunch_and_Event_Registrants.length,
+      `${lists.nameList.length} registrant(s) — pick a name, then tick Attended or Lunch.`);
+    return;
+  }
+
+  if (editedCol === QUICK_MARK.NAME_COL) {
+    setQuickMarkStatus(sheet, HEADERS.Lunch_and_Event_Registrants.length,
+      `Ready — tick Attended or Lunch to mark ${e.value || 'them'}.`);
+    return;
+  }
+
+  if (editedCol === QUICK_MARK.CLEAR_COL) {
+    clearQuickMarkInputs(sheet);
+    refreshQuickMarkDropdowns(sheet, null);
+    setQuickMarkStatus(sheet, HEADERS.Lunch_and_Event_Registrants.length, 'Cleared — choose a location to begin.');
+    return;
+  }
+
+  if (editedCol === QUICK_MARK.ATTENDED_COL || editedCol === QUICK_MARK.LUNCH_COL) {
+    if (!isTruthyCheckbox(e.value)) return; // un-ticking the panel box marks nothing
+    applyQuickMark(sheet, editedCol);
   }
 }
 
@@ -4576,12 +4758,15 @@ function syncRegistrations() {
   refreshFormCapacityLabelsForAllForms(registrySheet);
 
   const dashboardResult = renderProgramDashboard(false, { registrantRows: combinedRegistrantRows });
-  updateMasterLunchDashboard(dashboardResult.registrantsMoved ? null : combinedRegistrantRows);
+  const reusableRows = dashboardResult.registrantsMoved ? null : combinedRegistrantRows;
+  updateMasterLunchDashboard(reusableRows);
+  refreshMemoryTabs(reusableRows, null);
 
   flushPersistentRegistries();
   setLastSyncTime(syncStartedAt);
   flushAdminDigest('Registration sync'); // no-op unless something above actually needed attention
-  SpreadsheetApp.getActiveSpreadsheet().toast(`Registration sync complete ✅ (${newRows.length} new rows)`, 'Calendar & Form Manager', 5);
+  toastIfPossible(`Registration sync complete ✅ — ${newRows.length} new row(s), ` +
+    `${combinedRegistrantRows.length} registrant row(s) total.`);
 }
 
 function getDistinctFormIds(registrySheet, sessionRows) {
@@ -5616,12 +5801,18 @@ function renderFlatDateSheet(sheet, headers, allRows, opts) {
   sheet.clearFormats();
   sheet.getBandings().forEach(b => b.remove());
   sheet.getRange(1, 1, sheet.getMaxRows(), sheet.getMaxColumns()).clearDataValidations();
+  // Column visibility is a sheet-level property that survives clear(), so a
+  // tab whose hidden-column list has changed needs it re-asserted, not
+  // inherited. applyColumnVisibility() (called from the afterWrite hooks)
+  // shows everything not currently on the list.
 
   const todayKey = formatDateKey(new Date());
   const dateColIdx = headers.indexOf('Event_Date');
   const { upcoming, past } = partitionByDate(allRows, dateColIdx, todayKey);
 
-  const result = writeUpcomingPastSections(sheet, 1, headers, upcoming, past, opts);
+  // opts.startRow leaves room above the tables for a fixed block (the
+  // Registrants tab's Quick Mark panel), written by the caller afterwards.
+  const result = writeUpcomingPastSections(sheet, opts.startRow || 1, headers, upcoming, past, opts);
   sheet.setFrozenRows(result.upcomingHeaderRow);
 
   if (opts.afterWrite) opts.afterWrite(sheet, headers, result);
@@ -5640,12 +5831,239 @@ function renderRegistrantsSheet(force, allRows) {
   const sheet = getOrCreateSheet(ss, SHEET_NAMES.LUNCH_EVENT_REGISTRANTS);
   const headers = HEADERS.Lunch_and_Event_Registrants;
   const rows = allRows || readAllSectionedRows(sheet, headers, 'Event_ID');
-  return renderFlatDateSheet(sheet, headers, rows, {
+  const result = renderFlatDateSheet(sheet, headers, rows, {
     upcomingLabel: '⏳ Upcoming Registrants',
     pastLabel: '🕓 Past Registrants',
     force,
+    startRow: QUICK_MARK.rowCount + 1,
     afterWrite: applyRegistrantsFormatting
   });
+  writeQuickMarkPanel(sheet, headers, rows);
+  return result;
+}
+
+
+// ============================================================================
+// 6d. QUICK MARK  (the top-of-Registrants panel)
+// ============================================================================
+//
+// Marking people off on a serving day is the highest-frequency job in this
+// workbook and was the worst served: find the right one of hundreds of rows,
+// scroll right, tick two boxes, don't lose your place. The tab is sorted by
+// date, so a given program's people aren't even contiguous.
+//
+// The Quick Mark panel puts that on four cells at the top of the tab:
+// Location -> Program -> Name, each a dropdown narrowed by the one before it,
+// then Attended/Lunch checkboxes. Tick either and the matching registrant row
+// is updated in place, wherever it happens to be, and the panel reports what
+// it did and clears itself for the next person.
+//
+// The dropdowns are rebuilt on every edit of the cell to their left, because a
+// static list of every name in the workbook is not a usable dropdown once
+// there are hundreds — narrowing is the entire value.
+// ============================================================================
+
+const QUICK_MARK = {
+  bannerRow: 1,
+  labelRow: 2,
+  inputRow: 3,
+  statusRow: 4,
+  rowCount: 5, // 4 used + 1 spacer before the tables begin
+  // 1-based columns within the panel.
+  LOCATION_COL: 1,
+  EVENT_COL: 2,
+  NAME_COL: 3,
+  ATTENDED_COL: 4,
+  LUNCH_COL: 5,
+  CLEAR_COL: 6
+};
+
+const QUICK_MARK_LABELS = ['1. Location', '2. Program', '3. Name', '✓ Attended', '✓ Lunch', 'Clear'];
+
+/** Writes (or rewrites) the Quick Mark panel and seeds its Location dropdown. */
+function writeQuickMarkPanel(sheet, headers, rows) {
+  const numCols = Math.max(headers.length, QUICK_MARK_LABELS.length);
+
+  writeSectionBanner(sheet, QUICK_MARK.bannerRow, numCols,
+    '⚡ QUICK MARK — pick a location, program and name, then tick Attended / Lunch', { hero: true });
+
+  sheet.getRange(QUICK_MARK.labelRow, 1, 1, QUICK_MARK_LABELS.length)
+    .setValues([QUICK_MARK_LABELS])
+    .setFontSize(TYPO.HERO_LABEL.size)
+    .setFontWeight('bold')
+    .setFontColor(TYPO.HERO_LABEL.color)
+    .setBackground('#EFEFEF')
+    .setHorizontalAlignment('center');
+
+  // The input row itself: yellow, like every other "this is yours" cell.
+  const inputRange = sheet.getRange(QUICK_MARK.inputRow, 1, 1, QUICK_MARK_LABELS.length);
+  inputRange
+    .setBackground(MANUAL_ENTRY_CELL_TINT)
+    .setFontSize(TYPO.HERO_LABEL.size)
+    .setHorizontalAlignment('center')
+    .setVerticalAlignment('middle')
+    .setBorder(true, true, true, true, true, true, '#B7B7B7', SpreadsheetApp.BorderStyle.SOLID);
+  try { sheet.setRowHeight(QUICK_MARK.inputRow, ROW_HEIGHTS.HERO_DATA); } catch (err) { /* row absent */ }
+
+  applyValueListValidationBounded(sheet, QUICK_MARK.LOCATION_COL, Object.values(CALENDAR_MAP), QUICK_MARK.inputRow, 1);
+  [QUICK_MARK.ATTENDED_COL, QUICK_MARK.LUNCH_COL, QUICK_MARK.CLEAR_COL].forEach(col => {
+    sheet.getRange(QUICK_MARK.inputRow, col)
+      .setDataValidation(SpreadsheetApp.newDataValidation().requireCheckbox().build());
+  });
+
+  // Program/Name start empty and are filled in by the cascade as soon as a
+  // location is chosen — see refreshQuickMarkDropdowns().
+  refreshQuickMarkDropdowns(sheet, rows);
+
+  setQuickMarkStatus(sheet, numCols, 'Ready — choose a location to begin.');
+}
+
+/** The one-line feedback cell under the panel's inputs. */
+function setQuickMarkStatus(sheet, numCols, message) {
+  const width = Math.max(numCols || QUICK_MARK_LABELS.length, QUICK_MARK_LABELS.length);
+  const range = sheet.getRange(QUICK_MARK.statusRow, 1, 1, width);
+  try { range.breakApart(); } catch (err) { /* not merged */ }
+  range.merge()
+    .setValue(message)
+    .setFontSize(TYPO.MUTED.size + 1)
+    .setFontColor('#0B5394')
+    .setFontWeight('bold')
+    .setBackground('#FFFFFF')
+    .setHorizontalAlignment('left')
+    .setWrapStrategy(SpreadsheetApp.WrapStrategy.CLIP);
+}
+
+/**
+ * Rebuilds the Program and Name dropdowns from whatever Location/Program is
+ * currently selected, narrowing each list to what's actually possible.
+ *
+ * Sourced from the CURRENT registrant rows, not the Member_Roll tab: the point
+ * is to mark someone who is registered for a specific session, and offering a
+ * name nobody has registered under would just produce a "no match" a moment
+ * later. Member_Roll is the standing directory; this is today's actual list.
+ */
+function refreshQuickMarkDropdowns(sheet, rows) {
+  const headers = HEADERS.Lunch_and_Event_Registrants;
+  const map = getIndexMap(headers);
+  const registrantRows = rows || readAllSectionedRows(sheet, headers, 'Event_ID');
+
+  const location = String(sheet.getRange(QUICK_MARK.inputRow, QUICK_MARK.LOCATION_COL).getValue() || '').trim();
+  const program = String(sheet.getRange(QUICK_MARK.inputRow, QUICK_MARK.EVENT_COL).getValue() || '').trim();
+
+  const programs = {};
+  const names = {};
+  registrantRows.forEach(row => {
+    const rowLocation = String(row[map['Location']] || '').trim();
+    const rowEvent = String(row[map['Event']] || '').trim();
+    const rowName = String(row[map['Name']] || '').trim();
+    if (location && rowLocation !== location) return;
+    if (rowEvent) programs[rowEvent] = true;
+    if (program && rowEvent !== program) return;
+    if (rowName) names[rowName] = true;
+  });
+
+  const programList = Object.keys(programs).sort();
+  const nameList = Object.keys(names).sort();
+
+  applyValueListValidationBounded(sheet, QUICK_MARK.EVENT_COL, programList.length ? programList : ['(no programs yet)'],
+    QUICK_MARK.inputRow, 1);
+  applyValueListValidationBounded(sheet, QUICK_MARK.NAME_COL, nameList.length ? nameList : ['(no registrants yet)'],
+    QUICK_MARK.inputRow, 1);
+  return { programList, nameList };
+}
+
+/** Blanks the panel's inputs, ready for the next person. */
+function clearQuickMarkInputs(sheet) {
+  sheet.getRange(QUICK_MARK.inputRow, 1, 1, QUICK_MARK_LABELS.length).clearContent();
+}
+
+/**
+ * Applies a Quick Mark tick to the real registrant row(s).
+ *
+ * Matches on Location + Event + Name. A name legitimately appears on several
+ * rows — the same person registered for several dates of the same program — so
+ * this marks the one for the NEAREST session (today first, then the next
+ * upcoming, then the most recent past), which is what someone standing at a
+ * sign-in desk means. The status line always says which date it marked, so a
+ * wrong guess is visible immediately rather than silent.
+ */
+function applyQuickMark(sheet, column) {
+  const headers = HEADERS.Lunch_and_Event_Registrants;
+  const map = getIndexMap(headers);
+
+  const location = String(sheet.getRange(QUICK_MARK.inputRow, QUICK_MARK.LOCATION_COL).getValue() || '').trim();
+  const program = String(sheet.getRange(QUICK_MARK.inputRow, QUICK_MARK.EVENT_COL).getValue() || '').trim();
+  const name = String(sheet.getRange(QUICK_MARK.inputRow, QUICK_MARK.NAME_COL).getValue() || '').trim();
+  const numCols = headers.length;
+
+  if (!name) {
+    setQuickMarkStatus(sheet, numCols, '⚠️ Pick a name first — nothing was marked.');
+    sheet.getRange(QUICK_MARK.inputRow, column).setValue(false);
+    return;
+  }
+
+  const zones = getSectionZones(sheet, 'Event_ID');
+  const nameKey = normalizeNameKey(name);
+  const todayKey = formatDateKey(new Date());
+  const candidates = [];
+
+  zones.forEach(zone => {
+    const count = zone.dataEnd - zone.dataStart + 1;
+    if (count < 1) return;
+    const values = sheet.getRange(zone.dataStart, 1, count, numCols).getValues();
+    values.forEach((row, i) => {
+      if (normalizeNameKey(row[map['Name']]) !== nameKey) return;
+      if (location && String(row[map['Location']] || '').trim() !== location) return;
+      if (program && String(row[map['Event']] || '').trim() !== program) return;
+      const d = coerceDate(row[map['Event_Date']]);
+      candidates.push({ sheetRow: zone.dataStart + i, date: d, dateKey: d ? formatDateKey(d) : '' });
+    });
+  });
+
+  if (candidates.length === 0) {
+    setQuickMarkStatus(sheet, numCols,
+      `⚠️ No registrant row found for "${name}"${program ? ` on ${program}` : ''}${location ? ` at ${location}` : ''}. Nothing was marked.`);
+    sheet.getRange(QUICK_MARK.inputRow, column).setValue(false);
+    return;
+  }
+
+  // Today, else the soonest future date, else the most recent past one.
+  candidates.sort((a, b) => {
+    const rank = c => (c.dateKey === todayKey ? 0 : (c.dateKey > todayKey ? 1 : 2));
+    if (rank(a) !== rank(b)) return rank(a) - rank(b);
+    if (rank(a) === 2) return (b.date || 0) - (a.date || 0); // past: newest first
+    return (a.date || 0) - (b.date || 0);                    // future: soonest first
+  });
+  const target = candidates[0];
+
+  const isLunch = column === QUICK_MARK.LUNCH_COL;
+  const columnName = isLunch ? 'Lunch_Served' : 'Attended';
+  if (map[columnName] === undefined) {
+    setQuickMarkStatus(sheet, numCols, `⚠️ This tab has no "${columnName}" column yet — run Sync Registrations once.`);
+    return;
+  }
+
+  sheet.getRange(target.sheetRow, map[columnName] + 1).setValue(true);
+  // Ticking lunch implies they were there. Marking someone as fed but absent
+  // is never what anyone means, and the lunch count is derived from the tick.
+  if (isLunch && map['Attended'] !== undefined) {
+    sheet.getRange(target.sheetRow, map['Attended'] + 1).setValue(true);
+  }
+  // Hand-marking is a manual edit — say so, the same as any other.
+  if (map['Manual_Override'] !== undefined) {
+    const overrideCell = sheet.getRange(target.sheetRow, map['Manual_Override'] + 1);
+    const current = String(overrideCell.getValue() || '').trim();
+    if (current === 'Auto-Synced' || current === '') overrideCell.setValue('Manually Edited');
+  }
+
+  const dateLabel = target.date ? formatDateLabel(target.date) : 'an undated session';
+  const extra = candidates.length > 1 ? ` (${candidates.length} sessions matched — marked the nearest)` : '';
+  const what = isLunch ? 'lunch + attendance' : 'attendance';
+  setQuickMarkStatus(sheet, numCols, `✅ Marked ${what} for ${name} — ${dateLabel}${extra}.`);
+  toastIfPossible(`✅ ${name}: ${what} marked for ${dateLabel}.`);
+
+  clearQuickMarkInputs(sheet);
+  refreshQuickMarkDropdowns(sheet, null);
 }
 
 function renderTriageSheet(force, allRows) {
@@ -5667,6 +6085,28 @@ function renderTriageSheet(force, allRows) {
  * Order_Ahead_Flag / Event_Date columns, just with Triage adding a few
  * extra trailing columns that don't need special styling beyond zebra.
  */
+/**
+ * Columns on Registrants/Triage a person is MEANT to fill in. Everything else
+ * on the row came from a form or is derived, and gets no yellow — so "yellow
+ * means yours" holds across every tab in the workbook (same wash as the lunch
+ * dashboard's hand-entry columns, via labelManualEntryColumns()).
+ */
+const REGISTRANT_EDITABLE_COLUMNS = [
+  'Attended', 'Lunch_Served', 'Lunch_Type', 'Lunch_Status', 'Program_Status', 'Admin_Notes'
+];
+
+/**
+ * Columns that only ever matter when something has gone wrong — internal keys
+ * and the raw form link. Hidden during normal use; unhide from the Sheets UI
+ * (or read them in the formula bar) when debugging.
+ *
+ * Manual_Override is NOT hidden despite being machine-written: it is the one
+ * column that explains why a row is a different color, and hiding the legend
+ * to a color you can plainly see is worse than the column costing a little
+ * width.
+ */
+const REGISTRANT_HIDDEN_COLUMNS = ['Event_ID', 'Party_ID', 'Form_Source'];
+
 function applyRegistrantsFormatting(sheet, headers, result) {
   const map = getIndexMap(headers);
   const zones = [
@@ -5680,6 +6120,14 @@ function applyRegistrantsFormatting(sheet, headers, result) {
     applyValueListValidationBounded(sheet, map['Program_Status'] + 1, PROGRAM_STATUS_OPTIONS, z.start, z.count);
     applyValueListValidationBounded(sheet, map['Lunch_Status'] + 1, LUNCH_STATUS_OPTIONS, z.start, z.count);
     applyValueListValidationBounded(sheet, map['Lunch_Type'] + 1, REGISTRANT_LUNCH_TYPE_OPTIONS, z.start, z.count);
+    // Real checkboxes, not free text: a tick is one click and reads back as a
+    // boolean, which is what Served_Confirmed counts.
+    REGISTRANT_DAYOF_COLUMNS.forEach(h => {
+      if (map[h] === undefined) return;
+      sheet.getRange(z.start, map[h] + 1, z.count, 1)
+        .setDataValidation(SpreadsheetApp.newDataValidation().requireCheckbox().build())
+        .setHorizontalAlignment('center');
+    });
   });
 
   const overrideCol = map['Manual_Override'] + 1;
@@ -5687,11 +6135,30 @@ function applyRegistrantsFormatting(sheet, headers, result) {
   const lunchCol = map['Lunch_Status'] + 1;
   const orderAheadCol = map['Order_Ahead_Flag'] + 1;
   const dateCol = map['Event_Date'] + 1;
+  const editableCols = REGISTRANT_EDITABLE_COLUMNS
+    .filter(h => map[h] !== undefined)
+    .map(h => map[h] + 1);
 
   const rules = [];
   zones.forEach(z => {
     if (z.count < 1) return;
-    rules.push(...buildManualOverrideRowTintRules(sheet, z.start, z.count, headers.length, overrideCol, [programCol, lunchCol, orderAheadCol, dateCol]));
+    // MANUAL_OVERRIDE, RECONSIDERED. It used to tint most of the row purple,
+    // which fought with every other signal on it: the status colors, the
+    // month tint, and now the yellow editable band. On a tab where the
+    // interesting question is "who still needs marking?", a whole-row wash
+    // for "this row was hand-edited" is the least useful thing competing for
+    // the strongest visual channel.
+    //
+    // So the tint is now confined to the Manual_Override CELL itself — the
+    // column that names the state — and the row is left to say what staff
+    // actually scan for. The information is not lost, just demoted to where
+    // it belongs, and the cell is still impossible to miss when you look at
+    // the column.
+    const overrideRange = sheet.getRange(z.start, overrideCol, z.count, 1);
+    ['Manually Edited', 'Manually Added'].forEach(text => {
+      const rule = buildTextEqualsRuleForRanges([overrideRange], text, MANUAL_OVERRIDE_COLOR);
+      if (rule) rules.push(rule);
+    });
   });
 
   const activeZones = zones.filter(z => z.count > 0);
@@ -5711,10 +6178,96 @@ function applyRegistrantsFormatting(sheet, headers, result) {
     rules.push(SpreadsheetApp.newConditionalFormatRule().whenCellNotEmpty().setBackground(ORDER_AHEAD_FLAG_COLOR).setRanges(orderAheadRanges).build());
   }
 
+  // Location color-coding on the Location cell, same as every other tab.
+  const locRanges = activeZones.map(z => sheet.getRange(z.start, map['Location'] + 1, z.count, 1));
+  rules.push(...buildLocationColorRules(locRanges));
+
   sheet.setConditionalFormatRules(rules);
+
+  // The yellow "this is yours to fill in" wash, and the header pencils that
+  // label it — identical treatment to Master_Lunch_Dashboard's columns.
+  labelManualEntryColumns(sheet, result.upcomingHeaderRow, headers, REGISTRANT_EDITABLE_COLUMNS);
+  labelManualEntryColumns(sheet, result.pastHeaderRow, headers, REGISTRANT_EDITABLE_COLUMNS);
+  zones.forEach(z => {
+    if (z.count < 1) return;
+    tintManualEntryColumns(sheet, z.start, z.count, headers, REGISTRANT_EDITABLE_COLUMNS);
+  });
+
+  applyColumnVisibility(sheet, headers, REGISTRANT_HIDDEN_COLUMNS);
+  // Name is the row's identity; keep it and the date on screen while scrolling
+  // right through the form-supplied columns.
+  sheet.setFrozenColumns(Math.min(map['Name'] + 1, headers.length));
+
+  // Warn (don't block) on the columns the sync owns — a correction typed into
+  // Event_Date or Name doesn't move the registration, it just gets overwritten
+  // and loses the row's link to its session.
+  protectDerivedColumns(sheet, headers,
+    ['Event_Date', 'Location', 'Event', 'Name', 'Person_Type', 'Primary_Registrant',
+      'Party_Size', 'Order_Ahead_Flag', 'Event_ID', 'Party_ID'],
+    zones);
+
   // No autosize here on purpose: this runs as renderFlatDateSheet()'s
   // afterWrite hook, and that function autosizes immediately afterward.
   // Doing it in both places sized Registrants and Triage twice per render.
+}
+
+/**
+ * Warning-only protection on columns this script OWNS and rewrites.
+ *
+ * Deliberately warning-based (setWarningOnly(true)) rather than a hard lock:
+ * a hard protection would also block this script's own writes unless every
+ * render remembered to unprotect and re-protect, and an admin who genuinely
+ * needs to correct a cell shouldn't have to go hunting through protection
+ * settings to do it. What people actually need is to be TOLD, at the moment
+ * they type, that the value is derived and will be overwritten — which is
+ * exactly what the warning dialog says.
+ *
+ * Re-created from scratch each render (matched by description) so the
+ * protected range always matches the columns actually there.
+ */
+const PROTECTION_TAG = 'Auto-managed by Calendar & Form Manager';
+
+function protectDerivedColumns(sheet, headers, protectedNames, zones) {
+  const map = getIndexMap(headers);
+
+  // Cleared ONCE, for the whole sheet, before anything is re-created —
+  // clearing per zone would have each zone wipe the previous one's work.
+  // Only this script's own protections are touched; anyone else's are left be.
+  sheet.getProtections(SpreadsheetApp.ProtectionType.RANGE)
+    .filter(p => String(p.getDescription() || '').indexOf(PROTECTION_TAG) === 0)
+    .forEach(p => {
+      try { p.remove(); } catch (err) { /* someone else's, or already gone */ }
+    });
+
+  (zones || []).forEach(z => {
+    if (z.count < 1) return;
+    protectedNames.forEach(name => {
+      const idx = map[name];
+      if (idx === undefined) return;
+      try {
+        sheet.getRange(z.start, idx + 1, z.count, 1)
+          .protect()
+          .setDescription(`${PROTECTION_TAG} — "${name}" is filled in automatically and will be overwritten.`)
+          .setWarningOnly(true);
+      } catch (err) {
+        log(`ℹ️ Could not set a protection warning on "${name}" of ${sheet.getName()} (${err}).`);
+      }
+    });
+  });
+}
+
+/**
+ * Hides the columns named in `hiddenNames` and shows every other one, so a
+ * re-render can't leave a column hidden after it's been taken off the list.
+ */
+function applyColumnVisibility(sheet, headers, hiddenNames) {
+  const map = getIndexMap(headers);
+  const hide = new Set((hiddenNames || []).filter(h => map[h] !== undefined).map(h => map[h] + 1));
+  for (let c = 1; c <= headers.length; c++) {
+    try {
+      if (hide.has(c)) sheet.hideColumns(c); else sheet.showColumns(c);
+    } catch (err) { /* a column beyond the sheet's width — nothing to hide */ }
+  }
 }
 
 function renderLunchScheduleSheet(force, allRows) {
@@ -5755,6 +6308,268 @@ function applyLunchScheduleFormatting(sheet, headers, result) {
   if (notServingRule) rules.push(notServingRule);
 
   sheet.setConditionalFormatRules(rules);
+}
+
+
+// ============================================================================
+// 6c. MEMORY TABS  (Member_Roll / Program_Options)
+// ============================================================================
+//
+// Everything else in this workbook is derived: wipe it, re-sync, and it comes
+// back. These two tabs are the exception — they're where the ORGANIZATION'S
+// OWN knowledge accumulates, the things no calendar event or form response can
+// tell you. "Marion always brings her sister." "This program needs the big
+// room." "Cold lunch only, no dairy."
+//
+// Each tab is therefore split down the middle:
+//   LEFT  — recomputed from the registrant/session history every refresh.
+//           Never hand-edit; it will be overwritten.
+//   RIGHT — MEMBER_ROLL_STAFF_COLUMNS / PROGRAM_OPTIONS_STAFF_COLUMNS. Written
+//           only by people, never by this script. Keyed by Name (or
+//           Event+Location), so a row keeps its notes as long as the key is
+//           stable — and normalizeNameKey() makes the key survive the casing
+//           and spacing drift that "Jane Smith" vs "jane smith " produces
+//           across separate form submissions.
+//
+// This is also what the Quick Mark dropdowns are built from — the unique
+// people and programs, deduplicated once here rather than re-derived on every
+// keystroke.
+// ============================================================================
+
+/**
+ * Rebuilds both memory tabs from current data, preserving every staff column.
+ * Called at the end of a registration sync (where the source rows are already
+ * in memory) and from initSheet().
+ */
+function refreshMemoryTabs(registrantRows, sessionRows) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  try {
+    refreshMemberRoll(ss, registrantRows);
+    refreshProgramOptions(ss, sessionRows);
+  } catch (err) {
+    // Never let a memory-tab refresh take down a sync — these tabs are
+    // reference material, not the system of record.
+    log(`⚠️ Could not refresh the memory tabs (${err}) — the rest of the sync is unaffected.`);
+  }
+}
+
+/**
+ * One row per unique person, keyed on normalizeNameKey(Name). Recomputes the
+ * history columns, carries the staff columns forward untouched, and keeps a
+ * person on the roll even after their sessions age out — a member who came
+ * once last year is still a member you might want notes on.
+ */
+function refreshMemberRoll(ss, registrantRows) {
+  const sheet = getOrCreateSheet(ss, SHEET_NAMES.MEMBER_ROLL);
+  const headers = HEADERS.Member_Roll;
+  const map = getIndexMap(headers);
+
+  // What staff have already written, by person key.
+  const existingByKey = {};
+  readSimpleTable(sheet, headers).forEach(row => {
+    const key = normalizeNameKey(row[map['Name']]);
+    if (key) existingByKey[key] = row;
+  });
+
+  const lrHeaders = HEADERS.Lunch_and_Event_Registrants;
+  const lrMap = getIndexMap(lrHeaders);
+  const rows = registrantRows ||
+    readAllSectionedRows(getOrCreateSheet(ss, SHEET_NAMES.LUNCH_EVENT_REGISTRANTS), lrHeaders, 'Event_ID');
+
+  const people = {};
+  rows.forEach(row => {
+    const name = String(row[lrMap['Name']] || '').trim();
+    const key = normalizeNameKey(name);
+    if (!key) return;
+    const d = coerceDate(row[lrMap['Event_Date']]);
+    if (!people[key]) {
+      people[key] = { name, times: 0, first: d, last: d, locations: {}, lunches: {} };
+    }
+    const p = people[key];
+    p.name = name; // last spelling seen wins for DISPLAY; the key stays stable
+    p.times++;
+    if (d && (!p.first || d < p.first)) p.first = d;
+    if (d && (!p.last || d > p.last)) p.last = d;
+    const loc = String(row[lrMap['Location']] || '').trim();
+    if (loc) p.locations[loc] = true;
+    const lunch = String(row[lrMap['Lunch_Type']] || '').trim();
+    if (lunch && lunch !== 'No Lunch') p.lunches[lunch] = (p.lunches[lunch] || 0) + 1;
+  });
+
+  // Anyone already on the roll but absent from the current history stays,
+  // with their computed columns left as they were.
+  const outRows = [];
+  const seen = {};
+  Object.keys(people).sort((a, b) => people[a].name.localeCompare(people[b].name)).forEach(key => {
+    const p = people[key];
+    const row = new Array(headers.length).fill('');
+    const prior = existingByKey[key];
+    if (prior) MEMBER_ROLL_STAFF_COLUMNS.forEach(h => { row[map[h]] = prior[map[h]]; });
+    row[map['Name']] = p.name;
+    row[map['Times_Seen']] = p.times;
+    row[map['First_Seen']] = p.first || '';
+    row[map['Last_Seen']] = p.last || '';
+    row[map['Locations']] = Object.keys(p.locations).sort().join(', ');
+    row[map['Usual_Lunch']] = pickMostFrequent(p.lunches);
+    outRows.push(row);
+    seen[key] = true;
+  });
+  Object.keys(existingByKey).forEach(key => {
+    if (!seen[key]) outRows.push(existingByKey[key]);
+  });
+
+  writeMemoryTab(sheet, headers, outRows, {
+    banner: '👤 Member Roll — everyone who has ever registered',
+    staffColumns: MEMBER_ROLL_STAFF_COLUMNS,
+    dateColumns: ['First_Seen', 'Last_Seen'],
+    numberColumns: ['Times_Seen']
+  });
+  log(`Member_Roll refreshed: ${outRows.length} member(s).`);
+}
+
+/** One row per unique program (Event x Location), same recomputed/staff split. */
+function refreshProgramOptions(ss, sessionRows) {
+  const sheet = getOrCreateSheet(ss, SHEET_NAMES.PROGRAM_OPTIONS);
+  const headers = HEADERS.Program_Options;
+  const map = getIndexMap(headers);
+
+  const existingByKey = {};
+  readSimpleTable(sheet, headers).forEach(row => {
+    const key = `${normalizeNameKey(row[map['Event']])}|${normalizeNameKey(row[map['Location']])}`;
+    if (key !== '|') existingByKey[key] = row;
+  });
+
+  const regHeaders = HEADERS.Master_Program_Dashboard;
+  const regMap = getIndexMap(regHeaders);
+  const rows = sessionRows ||
+    readAllSectionedRows(getOrCreateSheet(ss, SHEET_NAMES.PROGRAM_DASHBOARD), regHeaders, 'Event_ID');
+
+  const todayKey = formatDateKey(new Date());
+  const programs = {};
+  rows.forEach(row => {
+    const title = String(row[regMap['Clean_Title']] || '').trim();
+    const location = String(row[regMap['Location']] || '').trim();
+    if (!title) return;
+    const key = `${normalizeNameKey(title)}|${normalizeNameKey(location)}`;
+    const d = coerceDate(row[regMap['Event_Date']]);
+    if (!programs[key]) {
+      programs[key] = { title, location, sessions: 0, next: null, last: null, typeTag: '', caps: {} };
+    }
+    const p = programs[key];
+    p.sessions++;
+    p.typeTag = normalizeTypeTag(row[regMap['Type_Tag']]);
+    if (d) {
+      const dk = formatDateKey(d);
+      if (dk >= todayKey && (!p.next || d < p.next)) p.next = d;
+      if (!p.last || d > p.last) p.last = d;
+    }
+    const cap = Number(row[regMap['Max_Capacity']]);
+    if (cap > 0) p.caps[cap] = (p.caps[cap] || 0) + 1;
+  });
+
+  const outRows = [];
+  const seen = {};
+  Object.keys(programs)
+    .sort((a, b) => programs[a].title.localeCompare(programs[b].title))
+    .forEach(key => {
+      const p = programs[key];
+      const row = new Array(headers.length).fill('');
+      const prior = existingByKey[key];
+      if (prior) PROGRAM_OPTIONS_STAFF_COLUMNS.forEach(h => { row[map[h]] = prior[map[h]]; });
+      row[map['Event']] = p.title;
+      row[map['Location']] = p.location;
+      row[map['Type_Tag']] = p.typeTag;
+      row[map['Sessions_Tracked']] = p.sessions;
+      row[map['Next_Date']] = p.next || '';
+      row[map['Last_Date']] = p.last || '';
+      // Only SUGGEST a capacity where the calendar is consistent about it —
+      // the staff column is theirs to set, so this never overwrites it.
+      if (!row[map['Usual_Capacity']]) row[map['Usual_Capacity']] = pickMostFrequent(p.caps);
+      outRows.push(row);
+      seen[key] = true;
+    });
+  Object.keys(existingByKey).forEach(key => {
+    if (!seen[key]) outRows.push(existingByKey[key]);
+  });
+
+  writeMemoryTab(sheet, headers, outRows, {
+    banner: '📋 Program Options — every program, with your standing notes',
+    staffColumns: PROGRAM_OPTIONS_STAFF_COLUMNS,
+    dateColumns: ['Next_Date', 'Last_Date'],
+    numberColumns: ['Sessions_Tracked']
+  });
+  log(`Program_Options refreshed: ${outRows.length} program(s).`);
+}
+
+/**
+ * Is this cell value a ticked checkbox? A Sheets checkbox reads back as a real
+ * boolean, but the same column filled in by hand, pasted, or read back through
+ * a formula can arrive as "TRUE"/"true"/"Yes"/1 — all of which a human plainly
+ * meant as yes, and none of which `=== true` catches.
+ */
+function isTruthyCheckbox(value) {
+  if (value === true) return true;
+  if (value === 1) return true;
+  const text = String(value === null || value === undefined ? '' : value).trim().toLowerCase();
+  return text === 'true' || text === 'yes' || text === 'y' || text === '1' || text === '✓';
+}
+
+/** The key with the highest count, or '' for an empty tally. */
+function pickMostFrequent(counts) {
+  const keys = Object.keys(counts || {});
+  if (keys.length === 0) return '';
+  return keys.sort((a, b) => counts[b] - counts[a])[0];
+}
+
+/**
+ * Reads a plain (single header row at row 2, banner at row 1) tab into rows,
+ * projected into `headers` order by NAME — so these tabs survive a layout
+ * change the same way the sectioned ones do (see buildHeaderProjection()).
+ */
+function readSimpleTable(sheet, headers) {
+  const lastRow = sheet.getLastRow();
+  if (lastRow < MEMORY_TAB_DATA_ROW) return [];
+  const lastCol = Math.max(sheet.getLastColumn(), headers.length);
+  const projection = buildHeaderProjection(sheet, MEMORY_TAB_HEADER_ROW, headers, lastCol);
+  const numCols = projection ? lastCol : headers.length;
+  let rows = getRowsPreservingFormulas(sheet, MEMORY_TAB_DATA_ROW, 1, lastRow - MEMORY_TAB_DATA_ROW + 1, numCols);
+  if (projection) rows = rows.map(row => projection.map(src => (src === -1 ? '' : row[src])));
+  // Blank trailing rows are not members.
+  return rows.filter(row => String(row[0] || '').trim() !== '');
+}
+
+const MEMORY_TAB_BANNER_ROW = 1;
+const MEMORY_TAB_HEADER_ROW = 2;
+const MEMORY_TAB_DATA_ROW = 3;
+
+/** Writes a memory tab: banner, header row, data, and the yellow staff-column wash. */
+function writeMemoryTab(sheet, headers, rows, options) {
+  const numCols = headers.length;
+  sheet.clear();
+  sheet.clearFormats();
+  sheet.getBandings().forEach(b => b.remove());
+  sheet.getRange(1, 1, sheet.getMaxRows(), sheet.getMaxColumns()).clearDataValidations();
+
+  writeSectionBanner(sheet, MEMORY_TAB_BANNER_ROW, numCols, options.banner);
+  writeSectionHeader(sheet, MEMORY_TAB_HEADER_ROW, numCols, headers);
+  labelManualEntryColumns(sheet, MEMORY_TAB_HEADER_ROW, headers, options.staffColumns);
+
+  if (rows.length > 0) {
+    sheet.getRange(MEMORY_TAB_DATA_ROW, 1, rows.length, numCols).setValues(rows);
+    const map = getIndexMap(headers);
+    (options.dateColumns || []).forEach(h => {
+      sheet.getRange(MEMORY_TAB_DATA_ROW, map[h] + 1, rows.length, 1).setNumberFormat('M/d/yyyy');
+    });
+    (options.numberColumns || []).forEach(h => {
+      sheet.getRange(MEMORY_TAB_DATA_ROW, map[h] + 1, rows.length, 1).setNumberFormat('0');
+    });
+    applyZebraStripingManualBounded(sheet, MEMORY_TAB_DATA_ROW, rows.length, numCols);
+    tintManualEntryColumns(sheet, MEMORY_TAB_DATA_ROW, rows.length, headers, options.staffColumns);
+  }
+
+  sheet.setFrozenRows(MEMORY_TAB_HEADER_ROW);
+  sheet.setFrozenColumns(1); // the name/program is the row's identity — keep it visible
+  autosizeColumns(sheet, { minCols: numCols, force: true });
 }
 
 
@@ -6093,14 +6908,30 @@ function writeProgramDashboardSheet(sheet, headers, map, sessionRows, todayData,
   const numCols = headers.length;
   let row = 1;
 
-  // --- Section A: Today at Each Location ---
-  writeSectionBanner(sheet, row, numCols, '📍 Today at Each Location');
+  // --- Section A: Today at Each Location (the hero block) ---
+  writeSectionBanner(sheet, row, numCols,
+    `📍 TODAY — ${Utilities.formatDate(new Date(), TIMEZONE, 'EEEE, MMM d, yyyy')}`, { hero: true });
   row++;
   writeSectionHeader(sheet, row, TODAY_AT_LOCATIONS_HEADERS.length, TODAY_AT_LOCATIONS_HEADERS);
   row++;
   const todayDataStart = row;
   const todayRowsOut = todayData.map(t => [t.location, t.programsToday, t.sessionsToday, t.registeredToday]);
-  if (todayRowsOut.length > 0) sheet.getRange(todayDataStart, 1, todayRowsOut.length, TODAY_AT_LOCATIONS_HEADERS.length).setValues(todayRowsOut);
+  if (todayRowsOut.length > 0) {
+    const todayRange = sheet.getRange(todayDataStart, 1, todayRowsOut.length, TODAY_AT_LOCATIONS_HEADERS.length);
+    todayRange.setValues(todayRowsOut).setVerticalAlignment('middle');
+    // Same treatment as the lunch dashboard's Today block: this is the line
+    // someone reads while walking past, so the numbers get real size.
+    sheet.getRange(todayDataStart, 1, todayRowsOut.length, 1)
+      .setFontSize(TYPO.HERO_LABEL.size).setFontWeight('bold');
+    sheet.getRange(todayDataStart, 2, todayRowsOut.length, TODAY_AT_LOCATIONS_HEADERS.length - 1)
+      .setFontSize(TYPO.HERO_VALUE.size)
+      .setFontWeight(TYPO.HERO_VALUE.weight)
+      .setFontColor(TYPO.HERO_VALUE.color)
+      .setHorizontalAlignment('center');
+    for (let r = 0; r < todayRowsOut.length; r++) {
+      try { sheet.setRowHeight(todayDataStart + r, ROW_HEIGHTS.HERO_DATA); } catch (err) { /* row absent */ }
+    }
+  }
   applyZebraStripingManualBounded(sheet, todayDataStart, todayRowsOut.length, TODAY_AT_LOCATIONS_HEADERS.length);
   row += todayRowsOut.length;
   row++; // spacer
@@ -6113,7 +6944,12 @@ function writeProgramDashboardSheet(sheet, headers, map, sessionRows, todayData,
   row++;
   sheet.getRange(row, 1, 1, metricHeaders.length)
     .setValues([[metrics.totalPrograms, metrics.totalSessions, metrics.totalRegistrations, metrics.totalUniqueParticipants, metrics.avgFillRate]])
-    .setFontWeight('bold').setFontSize(13).setHorizontalAlignment('center');
+    .setFontWeight(TYPO.HERO_VALUE.weight)
+    .setFontSize(TYPO.HERO_VALUE.size)
+    .setFontColor(TYPO.HERO_VALUE.color)
+    .setHorizontalAlignment('center')
+    .setVerticalAlignment('middle');
+  try { sheet.setRowHeight(row, ROW_HEIGHTS.HERO_DATA); } catch (err) { /* row absent */ }
   row++;
   row++; // spacer
 
@@ -6154,8 +6990,25 @@ function writeProgramDashboardSheet(sheet, headers, map, sessionRows, todayData,
   rules.push(...buildLocationColorRules(locationRanges));
   sheet.setConditionalFormatRules(rules);
 
+  // Type_Tag is the ONE cell on this table a human is meant to change (see
+  // handleProgramDashboardEdit) — mark it yellow like every other editable
+  // cell in the workbook, and warn on the derived columns around it.
+  labelManualEntryColumns(sheet, result.upcomingHeaderRow, headers, PROGRAM_DASHBOARD_EDITABLE_COLUMNS);
+  labelManualEntryColumns(sheet, result.pastHeaderRow, headers, PROGRAM_DASHBOARD_EDITABLE_COLUMNS);
+  zones.forEach(z => {
+    if (z.count < 1) return;
+    tintManualEntryColumns(sheet, z.start, z.count, headers, PROGRAM_DASHBOARD_EDITABLE_COLUMNS);
+  });
+  protectDerivedColumns(sheet, headers,
+    ['Event_Date', 'Clean_Title', 'Event_Time', 'Active_Count', 'Waitlist_Count',
+      'Remaining_Seats', 'Status', 'Form_ID', 'Event_ID', 'Calendar_Source'],
+    zones);
+
+  applyColumnVisibility(sheet, headers, PROGRAM_DASHBOARD_HIDDEN_COLUMNS);
+
   // Freeze through the Today block only, so it stays visible while the rest scrolls.
   sheet.setFrozenRows(todayDataStart + todayRowsOut.length - 1);
+  sheet.setFrozenColumns(3); // date, location, program name
   autosizeColumns(sheet, { force: !!force, minCols: headers.length });
   log(`renderProgramDashboard complete: ${todayRowsOut.length} location(s) today, ${upcoming.length} upcoming / ${past.length} past session row(s).`);
 }
@@ -6239,7 +7092,9 @@ function buildDashboardRollup(registrantRows) {
     if (!meta.location || meta.dateKey < todayKey) return;
     if (!isLunchOfferedOn(parseDateKey(meta.dateKey), meta.location)) return;
     const key = `${meta.dateKey}|${meta.location}`;
-    if (!rollup[key]) rollup[key] = { dateKey: meta.dateKey, location: meta.location, registeredCount: 0 };
+    if (!rollup[key]) {
+      rollup[key] = { dateKey: meta.dateKey, location: meta.location, registeredCount: 0, servedConfirmed: 0 };
+    }
   });
 
   if (registrantsSheet || registrantRows) {
@@ -6250,6 +7105,23 @@ function buildDashboardRollup(registrantRows) {
       const eventId = row[lrMap['Event_ID']];
       const meta = eventMeta[eventId];
       if (!meta) return;
+
+      // Served_Confirmed counts what staff actually TICKED, independently of
+      // what the form said — that's the whole point of the column. A person
+      // whose Lunch_Served box is checked counts here even if they never
+      // requested lunch on the form (walk-ins happen), which is why this is
+      // tallied before the Program_Status/Lunch_Status filter below.
+      if (isTruthyCheckbox(row[lrMap['Lunch_Served']])) {
+        const servedKey = `${meta.dateKey}|${meta.location}`;
+        if (!rollup[servedKey]) {
+          rollup[servedKey] = {
+            dateKey: meta.dateKey, location: meta.location,
+            registeredCount: 0, servedConfirmed: 0, unplanned: true
+          };
+        }
+        rollup[servedKey].servedConfirmed = (rollup[servedKey].servedConfirmed || 0) + 1;
+      }
+
       if (row[lrMap['Program_Status']] !== 'Active' || row[lrMap['Lunch_Status']] !== 'Needed') return;
 
       if (getCateringPolicyForLocation(meta.location) === CATERING_POLICIES.NEVER) {
@@ -6275,7 +7147,10 @@ function buildDashboardRollup(registrantRows) {
       // never invisible once a real person is expecting lunch.
       const key = `${meta.dateKey}|${meta.location}`;
       if (!rollup[key]) {
-        rollup[key] = { dateKey: meta.dateKey, location: meta.location, registeredCount: 0, unplanned: true };
+        rollup[key] = {
+          dateKey: meta.dateKey, location: meta.location,
+          registeredCount: 0, servedConfirmed: 0, unplanned: true
+        };
       }
       rollup[key].registeredCount++;
     });
@@ -6344,6 +7219,10 @@ function updateMasterLunchDashboard(registrantRows) {
     row[map['Lunch_Type']] = r.mealType || '';
     row[map['Meal_Shorthand']] = r.mealShorthand || '';
     row[map['Registered_Count']] = r.registeredCount;
+    // Blank rather than 0 until someone has actually ticked a box: a real
+    // zero ("nobody turned up") and "not counted yet" mean very different
+    // things to whoever reconciles this, and 0 would assert the first.
+    row[map['Served_Confirmed']] = r.servedConfirmed > 0 ? r.servedConfirmed : '';
   });
 
   writeMasterLunchDashboardSheet(sheet, plan, headers, existingTable, rollup);
@@ -6358,7 +7237,9 @@ function writeMasterLunchDashboardSheet(sheet, plan, headers, fullTableRows, rol
   sheet.getBandings().forEach(b => b.remove());
   sheet.getRange(1, 1, sheet.getMaxRows(), sheet.getMaxColumns()).clearDataValidations();
 
-  writeSectionBanner(sheet, plan.todayBannerRow, numCols, `📋 Today's Lunch Needs — ${Utilities.formatDate(new Date(), TIMEZONE, 'EEEE, MMM d, yyyy')}`);
+  writeSectionBanner(sheet, plan.todayBannerRow, numCols,
+    `📋 TODAY'S LUNCH — ${Utilities.formatDate(new Date(), TIMEZONE, 'EEEE, MMM d, yyyy')}`,
+    { hero: true });
   writeSectionHeader(sheet, plan.todayHeaderRow, TODAY_LUNCH_HEADERS.length, TODAY_LUNCH_HEADERS);
   const todayMap = getIndexMap(TODAY_LUNCH_HEADERS);
 
@@ -6401,21 +7282,40 @@ function writeMasterLunchDashboardSheet(sheet, plan, headers, fullTableRows, rol
       row[todayMap['Lunch_Type']] = match.mealType || '';
       row[todayMap['Meal_Shorthand']] = match.mealShorthand || '';
       row[todayMap['Registered_Count']] = match.registeredCount;
+      row[todayMap['Served_Confirmed']] = match.servedConfirmed > 0 ? match.servedConfirmed : '';
       const scheduleRow = scheduleRowByKey[`${todayKey}|${loc}`];
       row[todayMap['Total_to_Order']] = scheduleRow ? `=${totalToOrderColLetter}${scheduleRow}` : match.registeredCount;
     } else {
       row[todayMap['Lunch_Type']] = '';
       row[todayMap['Meal_Shorthand']] = 'No lunch orders today';
       row[todayMap['Registered_Count']] = 0;
+      row[todayMap['Served_Confirmed']] = '';
       row[todayMap['Total_to_Order']] = 0;
     }
     return row;
   });
 
   if (todayRows.length > 0) {
-    sheet.getRange(plan.todayDataStart, 1, todayRows.length, TODAY_LUNCH_HEADERS.length).setValues(todayRows);
-    sheet.getRange(plan.todayDataStart, todayMap['Registered_Count'] + 1, todayRows.length, 1).setNumberFormat('0');
-    sheet.getRange(plan.todayDataStart, todayMap['Total_to_Order'] + 1, todayRows.length, 1).setNumberFormat('0');
+    const todayRange = sheet.getRange(plan.todayDataStart, 1, todayRows.length, TODAY_LUNCH_HEADERS.length);
+    todayRange.setValues(todayRows);
+    // The Today block is the one thing on this tab someone reads standing up,
+    // mid-service, from further away than a spreadsheet is normally read — so
+    // it gets a real size step, taller rows, and centered numbers rather than
+    // being just another 10pt table.
+    todayRange.setFontSize(TYPO.HERO_LABEL.size).setVerticalAlignment('middle');
+    ['Registered_Count', 'Served_Confirmed', 'Total_to_Order'].forEach(h => {
+      sheet.getRange(plan.todayDataStart, todayMap[h] + 1, todayRows.length, 1)
+        .setNumberFormat('0')
+        .setFontSize(TYPO.HERO_VALUE.size)
+        .setFontWeight(TYPO.HERO_VALUE.weight)
+        .setFontColor(TYPO.HERO_VALUE.color)
+        .setHorizontalAlignment('center');
+    });
+    sheet.getRange(plan.todayDataStart, todayMap['Location'] + 1, todayRows.length, 1)
+      .setFontSize(TYPO.HERO_LABEL.size).setFontWeight('bold');
+    for (let r = 0; r < todayRows.length; r++) {
+      try { sheet.setRowHeight(plan.todayDataStart + r, ROW_HEIGHTS.HERO_DATA); } catch (err) { /* row absent */ }
+    }
   }
   applyZebraStripingManualBounded(sheet, plan.todayDataStart, todayRows.length, TODAY_LUNCH_HEADERS.length);
   sheet.getRange(plan.spacerRow, 1, 1, numCols).clearContent().setBackground('#FFFFFF');
@@ -6435,8 +7335,9 @@ function writeMasterLunchDashboardSheet(sheet, plan, headers, fullTableRows, rol
     { start: result.upcomingDataStart, count: result.upcomingCount },
     { start: result.pastDataStart, count: result.pastCount }
   ];
-  const numericCols = ['Registered_Count', 'Actual_Ordered', 'Standard_Buffer', 'Tester_Buffer', 'Day_1_In-Person',
-    'Day_1_Takeaway', 'Subs_In-Person', 'Subs_Takeaway', 'Total_Consumed', 'Thrown_Away', 'Discrepancy'];
+  const numericCols = ['Registered_Count', 'Served_Confirmed', 'Actual_Ordered', 'Standard_Buffer',
+    'Tester_Buffer', 'Day_1_In-Person', 'Day_1_Takeaway', 'Subs_In-Person', 'Subs_Takeaway',
+    'Total_Consumed', 'Thrown_Away', 'Discrepancy'];
 
   zones.forEach(z => {
     if (z.count < 1) return;
@@ -6484,5 +7385,19 @@ function writeMasterLunchDashboardSheet(sheet, plan, headers, fullTableRows, rol
     TODAY_LUNCH_HEADERS.length, todayLocationCol, []));
 
   sheet.setConditionalFormatRules(rules);
+
+  // Everything to the left of the hand-entry columns is derived from the forms
+  // and the menu — warn if someone types over it. Manual_Override is left
+  // editable on purpose: switching a row to "Manually Added" is precisely how
+  // staff tell the sync to stop managing it.
+  protectDerivedColumns(sheet, headers,
+    ['Event_Date', 'Location', 'Lunch_Type', 'Meal_Shorthand', 'Registered_Count', 'Served_Confirmed'],
+    zones);
+
+  // Nothing on this tab is an internal key, so nothing is hidden — but the
+  // call still runs, so a column taken OFF a future hidden list reappears.
+  applyColumnVisibility(sheet, headers, LUNCH_DASHBOARD_HIDDEN_COLUMNS);
+  sheet.setFrozenColumns(2); // date + location stay visible across the wide reconciliation columns
+
   autosizeColumns(sheet, { minCols: numCols });
 }
