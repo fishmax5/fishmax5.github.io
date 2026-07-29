@@ -112,13 +112,21 @@ system never overwrites them:
 **Total_to_Order** is a live formula: `Registered_Count + Standard_Buffer +
 Tester_Buffer`.
 
+Because there's one row per date **per location**, each row is **shaded by
+location** — Narberth light orange, Ashbridge light green, Zoom lavender — so a
+week with several sites reads as blocks of color. The `Event_Date` cell keeps
+its month tint and the ✍️ columns keep their yellow, and a row you've marked
+`Manually Edited`/`Manually Added` still goes purple on top of everything.
+
 ### 3. Lunch_and_Event_Registrants
 One row **per person, per session** — guests get their own rows, not a note on
-someone else's. `Location` and `Event` lead the row, so you never have to
-scroll to see which program a registrant belongs to.
+someone else's. `Event_Date` leads the row (as on every date-based tab), with
+`Location` and `Event` right behind it, so you never have to scroll to see which
+program a registrant belongs to.
 
 | Column | What it tells you |
 |---|---|
+| `Event_Date` | The session day — first column, tinted by month |
 | `Location` / `Event` | Which program and location this row belongs to |
 | `Person_Type` | `Attendee` (registered themselves) or `Guest` |
 | `Lunch_Type` | `Hot`, `Cold`, or `No Lunch` — the actual dish category, not just yes/no |
@@ -156,8 +164,10 @@ from all counts automatically.
 
 Setting a date to **Not Serving** removes it from the lunch question on that
 form and labels it "No Lunch Served," so nobody is asked to pick a meal that
-doesn't exist. Editing this tab immediately pushes updated labels to the
-affected forms.
+doesn't exist. If that leaves the form with **no** catered dates at all, the
+lunch questions come off the form entirely and its description says lunch isn't
+provided — and they come back on their own if you later add a catered date.
+Editing this tab immediately pushes both changes to the affected forms.
 
 ### 5. Config
 Four small settings blocks:
@@ -239,6 +249,9 @@ A few things worth knowing:
   are ignored, so there's no harm in leaving them checked.
 - Each date shows the **meal shorthand** next to it, and `(FULL - Waitlist)` once
   a capped session runs out of seats — so nobody joins a waitlist unknowingly.
+- **Nobody is asked about a lunch that isn't happening.** A date marked
+  `Not Serving` never appears as a lunch row, and a form with no catered dates
+  at all doesn't show the lunch question in either branch.
 - Choosing **Everyone, every date** on a `[Fixed]` series also covers dates
   added to that series *later* — they don't need to re-register.
 - There's a dedicated **Allergies / Dietary Needs** field.
@@ -247,6 +260,18 @@ A few things worth knowing:
 
 If someone changes their mind and submits again, the new answers win and the old
 row is marked `Superseded`.
+
+> **Forms already out in the world get updated too.** A program's form is
+> created once and reused for as long as that program runs, so a change to the
+> question layout used to reach only *new* forms — which is how an existing
+> form could still route someone who named one guest onto a "2 guests" page.
+> Every registration sync now checks each live form and rebuilds any that are
+> still on an older layout, **keeping the same link**, so calendar invites,
+> dashboard links and edit links all keep working. Nothing on
+> Lunch_and_Event_Registrants changes. The one visible side effect: a rebuilt
+> form's link stops arriving pre-checked until it's regenerated — the
+> dashboard's **View Live Form** link is refreshed right away, and the calendar
+> invite catches up the next time that program's dates change.
 
 ---
 
@@ -348,16 +373,23 @@ Check that location's **Lunch Service by Location** setting in Config. If it's
 **Lunch_Schedule**. If it's *Never*, it won't appear at all.
 
 **A form isn't asking about lunch**
-That location is set to *Never* in Config. Change it to *Always* or
-*By exception* — note that forms already created keep their current shape, so
-you may need to let a new form be generated.
+Either that location is set to *Never* in Config, or none of the dates on that
+form serve lunch. Fix whichever applies — set the policy to *Always*/*By
+exception*, or add a Hot/Cold row on **Lunch_Schedule** for one of its dates —
+and the question comes back on the next sync.
 
 **A `Never`-policy form still has a lunch question on it**
 New forms strip it automatically, and an existing form catches up the next
-time it gains a new date. To fix every existing form for a `Never` location
-right now, ask your developer to run `cleanupNeverPolicyForms()` from the
-Apps Script editor — it's a one-time cleanup, not a menu item, and it's safe
-to run more than once.
+time it gains a new date or its menu is edited. To fix every existing form for
+a `Never` location right now, ask your developer to run
+`cleanupNeverPolicyForms()` from the Apps Script editor — it's a one-time
+cleanup, not a menu item, and it's safe to run more than once.
+
+**A form still looks like the old version (guest-count page, wrong branch)**
+Run **Sync Registrations** — it rebuilds up to five out-of-date forms per run,
+so a big backlog may take a few passes. To force every form to be re-checked
+(after hand-editing one, say), ask your developer to run
+`recheckAllRegistrationForms()` from the Apps Script editor.
 
 **Nothing is syncing at all**
 Run **Check Triggers**. If that doesn't help, the script may need to be

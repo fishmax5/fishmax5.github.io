@@ -16,12 +16,19 @@
  *    - Master_Lunch_Dashboard   : "Today's Lunch Needs" (unchanged, always
  *      at the very top) + the full catering schedule, now likewise split
  *      into "Upcoming Lunch Schedule" / "Past Lunch Schedule" sub-tables.
+ *      Every row is one date PER LOCATION, so the row itself is tinted by
+ *      location (LOCATION_COLOR_MAP / buildLocationRowTintRules()) — except
+ *      the month-tinted Event_Date cell and the yellow hand-entry columns,
+ *      which keep their own meaning.
  *    - Lunch_and_Event_Registrants : one row per person per session, split
  *      into "Upcoming Registrants" / "Past Registrants" sub-tables. Leads
- *      with Location and Event so staff never scroll to see which program
- *      a row belongs to, keeps Manual_Override and Order_Ahead_Flag, and
- *      trails with Party_ID (an internal grouping key — see Party_ID/
- *      Party_Size below) as the very last column.
+ *      with Event_Date (like every other date-bearing tab), then Location
+ *      and Event so staff never scroll to see which program a row belongs
+ *      to, keeps Manual_Override and Order_Ahead_Flag, and trails with
+ *      Party_ID (an internal grouping key — see Party_ID/Party_Size below)
+ *      as the very last column. Re-ordering a HEADERS array no longer
+ *      scrambles data already on the tab: readAllSectionedRows() re-aligns
+ *      each row by header NAME (see buildHeaderProjection()).
  *    - Lunch_Schedule           : the day-by-day catering menu, now broken
  *      down PER LOCATION (one row per Event_Date x Location), with a
  *      "Not Serving" Type option — when a form covers a date that's marked
@@ -132,6 +139,26 @@
  *      A grid column whose guest name was left blank is ignored at parse
  *      time, so the pre-checked columns for guests you didn't bring cost
  *      nothing.
+ *    - LIVE FORMS ARE MIGRATED, NOT JUST THE TEMPLATE. A group's form is
+ *      created once and reused for as long as the group runs, so bumping
+ *      TEMPLATE_VERSION only ever fixed forms created afterward — everyone
+ *      filling in an existing form still met the old questions (and the old
+ *      mis-routing). migrateFormsToCurrentTemplate(), which runs at the end
+ *      of every syncRegistrations() import, rebuilds any form still on an
+ *      older template IN PLACE, keeping its Form ID so every link, registry
+ *      entry and calendar description stays valid. Forms already on the
+ *      current template are stamped and thereafter skipped without an API
+ *      call. Run recheckAllRegistrationForms() from the editor to force a
+ *      re-check (e.g. after hand-editing a form).
+ *    - NO LUNCH MEANS NO LUNCH QUESTION. The lunch grid only ever lists
+ *      dates that actually serve lunch (buildDateLabelSets()), and when NO
+ *      date on a form does — or the location never caters —
+ *      syncLunchQuestionsOnForm() takes both lunch questions off the form
+ *      entirely and says so in the description. They come back on their own
+ *      if a catered date later appears. On the data side buildRegistrantRow()
+ *      gates lunch demand on isLunchOfferedOn(), so the "everyone, every
+ *      date" branch's single who-eats answer can't book a meal on a
+ *      Not-Serving date.
  *    - The template calls setCollectEmail(true) and
  *      setAllowResponseEdits(true) — a submitter's email becomes a real
  *      identity key, Google auto-sends a receipt with an edit link, and
@@ -244,10 +271,11 @@ const CALENDAR_MAP = {
 /**
  * Hardcoded soft colors per "Month Year" label — used to tint the Event_Date
  * cell itself now (there is no separate Month column anywhere anymore).
- * Deliberately picked from TEAL / GOLD / MAGENTA families — NOT blue,
- * peach/orange, or lavender (LOCATION_COLOR_MAP's families), and NOT green/
- * red (status colors). Any month not listed falls back to getMonthColor()'s
- * deterministic generator, which draws from the same three safe hue bands.
+ * Deliberately picked from TEAL / GOLD / MAGENTA families — NOT green,
+ * peach/orange, or lavender (LOCATION_COLOR_MAP's families), and NOT
+ * green/red (status colors). Any month not listed falls back to
+ * getMonthColor()'s deterministic generator, which draws from the same three
+ * safe hue bands.
  */
 const MONTH_COLOR_MAP = {
   'January 2026': '#D6F0EC',
@@ -310,6 +338,12 @@ const LUNCH_DASHBOARD_MANUAL_COLUMNS = [
 ];
 const MANUAL_ENTRY_HEADER_COLOR = '#FFF2CC';
 const MANUAL_ENTRY_CELL_TINT = '#FFFCF0';
+/**
+ * Prepended to a hand-entry column's HEADER CELL by labelManualEntryColumns().
+ * Purely decorative — normalizeHeaderText() strips it back off, which is what
+ * keeps 'Standard_Buffer' usable as Master_Lunch_Dashboard's header-row marker.
+ */
+const MANUAL_ENTRY_PREFIX = '✍️';
 
 const MANUAL_OVERRIDE_OPTIONS = ['Auto-Synced', 'Manually Edited', 'Manually Added'];
 // 'Superseded' marks a row from an identity (Event_ID + Name + Person_Type)
@@ -322,10 +356,15 @@ const PROGRAM_STATUS_OPTIONS = ['Active', 'Waitlisted', 'Cancelled', 'Superseded
 const LUNCH_STATUS_OPTIONS = ['Needed', 'No Lunch', 'Waitlisted', 'Cancelled', 'Superseded'];
 const EVENT_TYPE_OPTIONS = ['Fixed', 'Regular'];
 
+/**
+ * One color per location, used BOTH for the Location cell itself and (on
+ * Master_Lunch_Dashboard) for the whole row band — see
+ * buildLocationColorRules() / buildLocationRowTintRules().
+ */
 const LOCATION_COLOR_MAP = {
-  'Narberth': '#CFE2F3',
-  'Ashbridge': '#FCE5CD',
-  'Zoom': '#D9D2E9'
+  'Narberth': '#FCE5CD',  // light orange
+  'Ashbridge': '#D9EAD3', // light green
+  'Zoom': '#D9D2E9'       // lavender
 };
 
 const SHEET_NAMES = {
@@ -357,13 +396,16 @@ const HEADERS = {
   // Order_Ahead_Flag is computed once, at import time, and never recomputed
   // afterward — a registration's notice period is a fact about when it
   // happened, not something that should drift if Config changes later.
-  // Location and Event lead the row so staff never have to scroll to see
-  // which program a registrant belongs to. Party_ID (the Form response ID)
-  // sits at the very end — it's an internal grouping key, not something
-  // staff read first; Party_Size (the headcount on that submission) stays
-  // up front near the person since it IS worth reading at a glance.
+  // Event_Date leads the row, the same as every other date-bearing tab (it
+  // is what these tabs are sorted and split by, and it carries the month
+  // tint), with Location and Event right behind it so staff never have to
+  // scroll to see which program a registrant belongs to. Party_ID (the Form
+  // response ID) sits at the very end — it's an internal grouping key, not
+  // something staff read first; Party_Size (the headcount on that
+  // submission) stays up front near the person since it IS worth reading at
+  // a glance.
   Lunch_and_Event_Registrants: [
-    'Location', 'Event', 'Event_Date', 'Manual_Override', 'Name', 'Person_Type', 'Lunch_Type',
+    'Event_Date', 'Location', 'Event', 'Manual_Override', 'Name', 'Person_Type', 'Lunch_Type',
     'Primary_Registrant', 'Party_Size', 'Form_Source', 'Program_Status', 'Lunch_Status',
     'Order_Ahead_Flag', 'Admin_Notes', 'Event_ID', 'Party_ID'
   ],
@@ -382,7 +424,7 @@ const HEADERS = {
   // array is what keeps every registrant column (Location/Event included)
   // landing in triage rows automatically, with no per-column wiring.
   Deleted_Event_Triage: [
-    'Location', 'Event', 'Event_Date', 'Manual_Override', 'Name', 'Person_Type', 'Lunch_Type',
+    'Event_Date', 'Location', 'Event', 'Manual_Override', 'Name', 'Person_Type', 'Lunch_Type',
     'Primary_Registrant', 'Party_Size', 'Form_Source', 'Program_Status', 'Lunch_Status',
     'Order_Ahead_Flag', 'Admin_Notes', 'Event_ID', 'Party_ID',
     'Deleted_Event_Title', 'Deleted_Event_Location', 'Flagged_Date', 'Triage_Notes'
@@ -540,6 +582,24 @@ const ATTENDANCE_MODE_CHOICES = {
 };
 
 /**
+ * Titles of the two branch pages. Stable markers, like TEMPLATE_ITEM_TITLES —
+ * restoreLunchQuestionsOnForm() needs them to put a re-added lunch question
+ * back on the right page instead of at the end of the form.
+ */
+const TEMPLATE_PAGE_TITLES = {
+  ALL_DATES: 'Everyone, Every Date',
+  SPECIFIC_DATES: 'Specific Dates'
+};
+
+/**
+ * The title of the guest-count question on templates v1/v2. Nothing builds
+ * this any more — it is kept purely so isFormOnCurrentTemplate() can
+ * recognize a form that was copied from one of those older templates and
+ * still carries the branch pages behind it. See migrateFormsToCurrentTemplate().
+ */
+const LEGACY_GUEST_COUNT_TITLE = 'Guest Count';
+
+/**
  * Grid columns and all-dates lunch choices. FIXED at four entries on every
  * form, deliberately: the guest-count question and its four branch pages
  * are gone (see getOrCreateTemplateForm()), so there is nothing left to
@@ -602,6 +662,22 @@ function getOrCreateTemplateForm() {
   }
 
   const form = FormApp.create('TEMPLATE — Registration Form Base (do not edit or delete)');
+  addTemplateItemsToForm(form);
+
+  props.setProperty(TEMPLATE_FORM_PROP_KEY, form.getId());
+  log(`Created template registration form: ${form.getId()}`);
+  return form;
+}
+
+/**
+ * Writes the current template's settings, questions and single navigation
+ * rule onto `form` — which is EMPTY when called from
+ * getOrCreateTemplateForm(), and freshly emptied when called from
+ * rebuildFormFromCurrentTemplate() to bring a live form built on an older
+ * template up to date. Adds nothing per-group: dates, the footer note and
+ * the description are layered on afterwards by the caller.
+ */
+function addTemplateItemsToForm(form) {
   form.setCollectEmail(true);
   form.setAllowResponseEdits(true);
 
@@ -618,21 +694,18 @@ function getOrCreateTemplateForm() {
     .setRequired(true);
 
   // --- Branch A: everyone, every date ----------------------------------
-  const allDatesPage = form.addPageBreakItem().setTitle('Everyone, Every Date');
-  form.addCheckboxItem().setTitle(TEMPLATE_ITEM_TITLES.ALL_DATES_LUNCH_PEOPLE)
-    .setChoiceValues(PERSON_COLUMN_LABELS)
-    .setHelpText('Uncheck anyone who will not be eating. Ignore rows for guests you did not name.');
+  const allDatesPage = form.addPageBreakItem().setTitle(TEMPLATE_PAGE_TITLES.ALL_DATES);
+  addAllDatesLunchItem(form);
   form.addTextItem().setTitle(TEMPLATE_ITEM_TITLES.ALLERGIES);
   form.addSectionHeaderItem().setTitle(TEMPLATE_ITEM_TITLES.FOOTER);
   form.addParagraphTextItem().setTitle(TEMPLATE_ITEM_TITLES.ADDITIONAL_NOTES);
   allDatesPage.setGoToPage(FormApp.PageNavigationType.SUBMIT);
 
   // --- Branch B: per-date roster ---------------------------------------
-  const specificPage = form.addPageBreakItem().setTitle('Specific Dates');
+  const specificPage = form.addPageBreakItem().setTitle(TEMPLATE_PAGE_TITLES.SPECIFIC_DATES);
   form.addCheckboxGridItem().setTitle(TEMPLATE_ITEM_TITLES.ATTENDANCE_GRID)
     .setRows([TEMPLATE_GRID_PLACEHOLDER_ROW]).setColumns(PERSON_COLUMN_LABELS);
-  form.addCheckboxGridItem().setTitle(TEMPLATE_ITEM_TITLES.LUNCH_GRID)
-    .setRows([TEMPLATE_GRID_PLACEHOLDER_ROW]).setColumns(PERSON_COLUMN_LABELS);
+  addLunchGridItem(form);
   form.addTextItem().setTitle(TEMPLATE_ITEM_TITLES.ALLERGIES);
   form.addSectionHeaderItem().setTitle(TEMPLATE_ITEM_TITLES.FOOTER);
   form.addParagraphTextItem().setTitle(TEMPLATE_ITEM_TITLES.ADDITIONAL_NOTES);
@@ -643,10 +716,20 @@ function getOrCreateTemplateForm() {
     modeItem.createChoice(ATTENDANCE_MODE_CHOICES.ALL_DATES, allDatesPage),
     modeItem.createChoice(ATTENDANCE_MODE_CHOICES.INDIVIDUAL, specificPage)
   ]);
+}
 
-  props.setProperty(TEMPLATE_FORM_PROP_KEY, form.getId());
-  log(`Created template registration form: ${form.getId()}`);
-  return form;
+/** The all-dates branch's who-eats checkbox. Appended wherever the cursor is — callers position it. */
+function addAllDatesLunchItem(form) {
+  return form.addCheckboxItem().setTitle(TEMPLATE_ITEM_TITLES.ALL_DATES_LUNCH_PEOPLE)
+    .setChoiceValues(PERSON_COLUMN_LABELS)
+    .setHelpText('Uncheck anyone who will not be eating. Ignore rows for guests you did not name. ' +
+      'Applies only to the dates lunch is actually served on.');
+}
+
+/** The per-date lunch roster grid. Rows are set later by applyFormDateLabels(). */
+function addLunchGridItem(form) {
+  return form.addCheckboxGridItem().setTitle(TEMPLATE_ITEM_TITLES.LUNCH_GRID)
+    .setRows([TEMPLATE_GRID_PLACEHOLDER_ROW]).setColumns(PERSON_COLUMN_LABELS);
 }
 
 /**
@@ -655,10 +738,15 @@ function getOrCreateTemplateForm() {
  * note when any date is lunch-free, and a tip about the "all dates" option
  * for Fixed-series forms.
  */
-function buildFormDescription(locationName, dateLabels, isFixed) {
+function buildFormDescription(locationName, dateLabels, isFixed, hasLunchDates) {
   const dateList = dateLabels.map(label => `• ${label}`).join('\n');
   let description = `Location: ${locationName}\n\nDates:\n${dateList}\n\nPlease register below.`;
-  if (dateLabels.some(l => l.indexOf('No Lunch Served') !== -1)) {
+  if (hasLunchDates === false) {
+    // Nothing on this form is catered, so the form isn't asking about lunch
+    // at all (see syncLunchQuestionsOnForm()) — say so rather than leaving
+    // its absence to be guessed at.
+    description += `\n\nNote: Lunch is not provided on any of these dates, so there is nothing to choose.`;
+  } else if (dateLabels.some(l => l.indexOf('No Lunch Served') !== -1)) {
     description += `\n\nNote: Lunch is not provided on any date marked "No Lunch Served" above.`;
   }
   if (isFixed) {
@@ -731,6 +819,33 @@ function saveAllDatesRegistryEntry(formId, entry) {
   __allDatesRegistryDirty = true;
 }
 
+/**
+ * Which template version each LIVE (per-group) form was built from — the
+ * thing that was missing when TEMPLATE_VERSION went to 3: bumping it rebuilt
+ * the cached TEMPLATE, but every form already copied from an older one kept
+ * its old questions, and those are the forms people actually fill in. See
+ * migrateFormsToCurrentTemplate(), which reads this to know what it can skip
+ * without an API call.
+ */
+const FORM_TEMPLATE_VERSION_PROP_KEY = 'FORM_TEMPLATE_VERSIONS_V1';
+
+let __formTemplateVersionCache = null;
+let __formTemplateVersionDirty = false;
+
+function getFormTemplateVersions() {
+  if (__formTemplateVersionCache) return __formTemplateVersionCache;
+  const raw = PropertiesService.getScriptProperties().getProperty(FORM_TEMPLATE_VERSION_PROP_KEY);
+  __formTemplateVersionCache = raw ? JSON.parse(raw) : {};
+  return __formTemplateVersionCache;
+}
+
+function setFormTemplateVersion(formId, version) {
+  const versions = getFormTemplateVersions();
+  if (versions[formId] === version) return;
+  versions[formId] = version;
+  __formTemplateVersionDirty = true;
+}
+
 /** Writes back whichever persistent registries were actually modified. Safe to call repeatedly — a clean registry costs nothing. */
 function flushPersistentRegistries() {
   const props = PropertiesService.getScriptProperties();
@@ -746,6 +861,10 @@ function flushPersistentRegistries() {
     props.setProperty(FORM_LABEL_FINGERPRINT_PROP_KEY, JSON.stringify(__formLabelFingerprintCache));
     __formLabelFingerprintDirty = false;
   }
+  if (__formTemplateVersionDirty && __formTemplateVersionCache) {
+    props.setProperty(FORM_TEMPLATE_VERSION_PROP_KEY, JSON.stringify(__formTemplateVersionCache));
+    __formTemplateVersionDirty = false;
+  }
 }
 
 const SYNC_LOCK_WAIT_MS = 10 * 1000;
@@ -754,13 +873,25 @@ const TIMEZONE = SpreadsheetApp.getActiveSpreadsheet()
   ? SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone()
   : Session.getScriptTimeZone();
 
+/**
+ * A header cell's canonical name. labelManualEntryColumns() decorates the
+ * hand-entry columns' header cells with MANUAL_ENTRY_PREFIX, so the literal
+ * cell text on Master_Lunch_Dashboard reads "✍️ Standard_Buffer" — every
+ * header lookup has to see through that decoration, or a column (and, for
+ * findAllHeaderRows(), the entire header row it marks) becomes invisible.
+ */
+function normalizeHeaderText(value) {
+  const text = String(value === null || value === undefined ? '' : value).trim();
+  return text.indexOf(MANUAL_ENTRY_PREFIX) === 0 ? text.substring(MANUAL_ENTRY_PREFIX.length).trim() : text;
+}
+
 /** Scans Row 1 for an exact header match and returns its 1-based column index (flat, single-header sheets like Config). */
 function getColumnIndex(sheet, colName) {
   const lastCol = sheet.getLastColumn();
   if (lastCol < 1) return -1;
   const headerRow = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
   for (let i = 0; i < headerRow.length; i++) {
-    if (String(headerRow[i]).trim() === colName) return i + 1;
+    if (normalizeHeaderText(headerRow[i]) === colName) return i + 1;
   }
   log(`⚠️ getColumnIndex: header "${colName}" not found on sheet "${sheet.getName()}"`);
   return -1;
@@ -779,8 +910,8 @@ function getHeaderMapAt(sheet, headerRow) {
   if (lastCol < 1) return map;
   const headerRowValues = sheet.getRange(headerRow, 1, 1, lastCol).getValues()[0];
   headerRowValues.forEach((h, i) => {
-    const name = String(h).trim();
-    if (name) map[name] = i + 1;
+    const name = normalizeHeaderText(h);
+    if (name && map[name] === undefined) map[name] = i + 1;
   });
   return map;
 }
@@ -798,7 +929,7 @@ function findAllHeaderRows(sheet, uniqueHeaderText, maxRowsToScan) {
   const values = sheet.getRange(1, 1, lastRow, lastCol).getValues();
   const rows = [];
   for (let r = 0; r < values.length; r++) {
-    if (values[r].some(v => String(v).trim() === uniqueHeaderText)) rows.push(r + 1);
+    if (values[r].some(v => normalizeHeaderText(v) === uniqueHeaderText)) rows.push(r + 1);
   }
   return rows;
 }
@@ -892,6 +1023,32 @@ function buildLocationColorRules(ranges) {
   );
 }
 
+/**
+ * Same colors as buildLocationColorRules(), but painted across a row BAND
+ * rather than just the Location cell, keyed off that row's own Location
+ * column — so a lunch schedule mixing several locations on the same date
+ * reads as blocks of color instead of one tinted cell per row.
+ *
+ * excludeCols (1-based) carves out the cells that already carry their own
+ * meaning — the month-tinted Event_Date, the yellow hand-entry columns — the
+ * same way buildManualOverrideRowTintRules() does. Push these rules AFTER any
+ * more specific rule over the same cells (the purple manual-override tint,
+ * the grey "Not Serving" type cell): the first matching rule wins.
+ */
+function buildLocationRowTintRules(sheet, dataStartRow, numRows, numCols, locationCol, excludeCols) {
+  if (numRows < 1 || !locationCol) return [];
+  const colLetter = columnToLetter(locationCol);
+  const ranges = buildRowRangesExcludingColumns(sheet, dataStartRow, numRows, numCols, excludeCols);
+  if (ranges.length === 0) return [];
+  return Object.keys(LOCATION_COLOR_MAP).map(loc =>
+    SpreadsheetApp.newConditionalFormatRule()
+      .whenFormulaSatisfied(`=$${colLetter}${dataStartRow}="${loc}"`)
+      .setBackground(LOCATION_COLOR_MAP[loc])
+      .setRanges(ranges)
+      .build()
+  );
+}
+
 /** Converts a 1-based column index to its A1 letter(s) (1 -> 'A', 27 -> 'AA'). */
 function columnToLetter(col) {
   let letter = '';
@@ -951,7 +1108,7 @@ function labelManualEntryColumns(sheet, headerRow, headers, manualColumnNames) {
     const idx = headers.indexOf(name);
     if (idx === -1) return;
     sheet.getRange(headerRow, idx + 1)
-      .setValue(`✍️ ${name}`)
+      .setValue(`${MANUAL_ENTRY_PREFIX} ${name}`)
       .setBackground(MANUAL_ENTRY_HEADER_COLOR)
       .setFontColor('#000000')
       .setFontWeight('bold');
@@ -1369,8 +1526,12 @@ function computeFormLabelFingerprint(attendanceLabels, lunchLabels) {
 
 /**
  * Sets a form's ATTENDANCE_GRID rows to attendanceLabels and its LUNCH_GRID
- * rows to lunchLabels (across every guest-count branch), skipping the whole
- * thing when the labels match what we last wrote to that form.
+ * rows to lunchLabels, skipping the whole thing when the labels match what we
+ * last wrote to that form.
+ *
+ * An EMPTY lunchLabels list means no date on this form serves lunch, in which
+ * case the lunch grid isn't on the form at all any more (see
+ * syncLunchQuestionsOnForm()) — the loop below simply finds nothing to write.
  *
  * options.form    — an already-open Form, to avoid a second openById()
  * options.force   — write even if the fingerprint matches
@@ -1388,8 +1549,10 @@ function applyFormDateLabels(formId, attendanceLabels, lunchLabels, options) {
     const items = form.getItems();
     items.filter(it => it.getTitle() === TEMPLATE_ITEM_TITLES.ATTENDANCE_GRID)
       .forEach(it => it.asCheckboxGridItem().setRows(attendanceLabels));
-    items.filter(it => it.getTitle() === TEMPLATE_ITEM_TITLES.LUNCH_GRID)
-      .forEach(it => it.asCheckboxGridItem().setRows(lunchLabels));
+    if (lunchLabels && lunchLabels.length > 0) {
+      items.filter(it => it.getTitle() === TEMPLATE_ITEM_TITLES.LUNCH_GRID)
+        .forEach(it => it.asCheckboxGridItem().setRows(lunchLabels));
+    }
   } catch (err) {
     log(`⚠️ Could not write date labels to form ${formId}${options.context ? ` (${options.context})` : ''}: ${err}`);
     return false;
@@ -1413,15 +1576,18 @@ function applyFormDateLabels(formId, attendanceLabels, lunchLabels, options) {
  * Form"). It has to be regenerated whenever the grid rows change, which is
  * exactly when the label writes happen.
  *
- * Prefill entries are emitted for EVERY guest-count branch's grids at once.
- * Forms simply ignores the parameters for pages a given respondent never
- * visits, so one URL covers all four branches.
+ * Entries are emitted for BOTH branches' items at once — the two roster
+ * grids and the all-dates who-eats checkbox. Forms simply ignores the
+ * parameters for a page a given respondent never visits, so one URL covers
+ * whichever branch they pick.
  *
  * KNOWN SOFT EDGE: a prefill value only matches a row whose label is still
  * byte-identical, so after refreshFormCapacityLabelsForAllForms() appends a
  * "(FULL - Waitlist)" hint to a date, the already-published link stops
  * pre-checking THAT date until the link is regenerated (next time the form
- * gains/loses dates). Every other date still pre-checks, and a full sign-up
+ * gains/loses dates). The same applies to a link published before
+ * migrateFormsToCurrentTemplate() rebuilt its form, since the entry IDs
+ * themselves change. Every other date still pre-checks, and a full sign-up
  * is never wrong — just one box short of pre-filled. Regenerating on every
  * capacity change would mean rewriting every calendar description on every
  * sync, which costs far more than it saves.
@@ -1478,15 +1644,16 @@ function buildRegistrationUrl(form) {
 
 /**
  * Strips both lunch questions — the per-date LUNCH_GRID and the all-dates
- * who-eats checkbox — from a form belonging to a location whose catering
- * policy is NEVER. Asking a Zoom attendee to pick lunch is noise at best
- * and a wrong expectation at worst.
+ * who-eats checkbox — off a form that has no lunch to offer: a location
+ * whose catering policy is NEVER, or a form none of whose dates serve
+ * lunch. Asking someone to pick a lunch that isn't being served is noise at
+ * best and a wrong expectation at worst.
  *
  * The parser needs no special case for this: getGridResponseByTitle()
  * returns null when the item is absent and getResponseValueByTitle()
  * returns '', both of which already resolve to "No Lunch" for everyone.
  */
-function removeLunchQuestionsFromForm(form, locationName) {
+function removeLunchQuestionsFromForm(form, locationName, reason) {
   const doomed = [TEMPLATE_ITEM_TITLES.LUNCH_GRID, TEMPLATE_ITEM_TITLES.ALL_DATES_LUNCH_PEOPLE];
   let removed = 0;
   form.getItems().forEach(item => {
@@ -1498,7 +1665,71 @@ function removeLunchQuestionsFromForm(form, locationName) {
       log(`⚠️ Could not remove "${item.getTitle()}" from the ${locationName} form (${err}).`);
     }
   });
-  if (removed > 0) log(`Removed ${removed} lunch question(s) from a ${locationName} form — that location's catering policy is "${CATERING_POLICIES.NEVER}".`);
+  if (removed > 0) {
+    log(`Removed ${removed} lunch question(s) from a ${locationName} form — ` +
+      (reason || `that location's catering policy is "${CATERING_POLICIES.NEVER}"`) + '.');
+  }
+  return removed;
+}
+
+/**
+ * The inverse of removeLunchQuestionsFromForm(): puts a stripped lunch
+ * question back when lunch returns to a form (a Fixed series that gains its
+ * first catered date, a menu row added to a By-exception location). Without
+ * this, "hide the question when there's nothing to eat" would be a one-way
+ * door on a form that outlives the dates it was created with.
+ *
+ * A re-added item lands at the END of the form, so each one is moved back to
+ * its template position — beside the attendance grid on the Specific Dates
+ * page, and first on the Everyone, Every Date page. Rows are left as the
+ * placeholder; the caller's applyFormDateLabels({ force: true }) sets them.
+ */
+function restoreLunchQuestionsOnForm(form) {
+  const titles = form.getItems().map(it => it.getTitle());
+  let restored = 0;
+
+  if (titles.indexOf(TEMPLATE_ITEM_TITLES.LUNCH_GRID) === -1) {
+    const gridItem = addLunchGridItem(form);
+    const attendanceIdx = form.getItems().findIndex(it => it.getTitle() === TEMPLATE_ITEM_TITLES.ATTENDANCE_GRID);
+    if (attendanceIdx !== -1) form.moveItem(gridItem.getIndex(), attendanceIdx + 1);
+    restored++;
+  }
+
+  if (titles.indexOf(TEMPLATE_ITEM_TITLES.ALL_DATES_LUNCH_PEOPLE) === -1) {
+    const checkboxItem = addAllDatesLunchItem(form);
+    const pageIdx = form.getItems().findIndex(it =>
+      it.getType() === FormApp.ItemType.PAGE_BREAK && it.getTitle() === TEMPLATE_PAGE_TITLES.ALL_DATES);
+    if (pageIdx !== -1) form.moveItem(checkboxItem.getIndex(), pageIdx + 1);
+    restored++;
+  }
+
+  if (restored > 0) log(`Restored ${restored} lunch question(s) to form ${form.getId()} — it has catered dates again.`);
+  return restored;
+}
+
+/**
+ * Single decision point for whether a form asks about lunch at all: it does
+ * when its location caters AND at least one date on the form actually
+ * serves lunch. Both directions are handled, so a form self-heals whichever
+ * way its schedule moves.
+ *
+ * Per-DATE filtering is separate and already handled by buildDateLabelSets()
+ * — the lunch grid's rows are only the dates that serve lunch, so a date
+ * marked "Not Serving" never appears as a lunch row even on a form whose
+ * other dates do.
+ *
+ * Returns how many questions were added or removed, so a caller can force
+ * the date-label write that has to follow a restore (a restored grid still
+ * holds the template's placeholder row).
+ */
+function syncLunchQuestionsOnForm(form, locationName, hasLunchDates) {
+  if (getCateringPolicyForLocation(locationName) === CATERING_POLICIES.NEVER) {
+    return removeLunchQuestionsFromForm(form, locationName);
+  }
+  if (!hasLunchDates) {
+    return removeLunchQuestionsFromForm(form, locationName, 'no date on this form serves lunch');
+  }
+  return restoreLunchQuestionsOnForm(form);
 }
 
 
@@ -1563,8 +1794,20 @@ function refreshFormsForChangedLunchDate(changedDate, location) {
 
     const capacityHints = buildCapacityHintsFromRegistryRows(formRows, map);
     const { allDateLabels, lunchDateLabels } = buildDateLabelSets(datesForForm, formLocation, capacityHints);
-    const lunchLabels = lunchDateLabels.length > 0 ? lunchDateLabels : ['No lunch served for any date on this form'];
-    if (applyFormDateLabels(formId, allDateLabels, lunchLabels, { context: 'Lunch_Schedule edit' })) {
+
+    // A menu edit is exactly how a form gains or loses its last lunch date,
+    // so the question set is re-checked here, not just the row labels.
+    let form = null;
+    let questionsChanged = 0;
+    try {
+      form = FormApp.openById(formId);
+      questionsChanged = syncLunchQuestionsOnForm(form, formLocation, lunchDateLabels.length > 0);
+    } catch (err) {
+      log(`⚠️ Could not open form ${formId} to re-check its lunch questions after a Lunch_Schedule edit (${err}).`);
+    }
+
+    if (applyFormDateLabels(formId, allDateLabels, lunchDateLabels,
+      { form, force: questionsChanged > 0, context: 'Lunch_Schedule edit' })) {
       log(`Refreshed form ${formId}'s date labels after a Lunch_Schedule edit affecting ${changedKey} (${formLocation}).`);
     }
   });
@@ -2278,6 +2521,22 @@ function onEdit(e) {
 }
 
 /**
+ * A 0-based { headerName: index } map read off the table's OWN header row,
+ * falling back to the canonical array when the sheet's row can't supply one.
+ *
+ * An onEdit handler has to trust the sheet, not the constant: right after a
+ * HEADERS layout changes, the tab still holds the previous order until its
+ * next render, and a map built from the constant would flip Manual_Override
+ * on top of whatever column now sits at that index.
+ */
+function getLiveHeaderMap(sheet, headerRow, headers) {
+  const sheetMap = getHeaderMapAt(sheet, headerRow);
+  const map = {};
+  headers.forEach(h => { if (sheetMap[h]) map[h] = sheetMap[h] - 1; });
+  return map['Manual_Override'] === undefined ? getIndexMap(headers) : map;
+}
+
+/**
  * Shared auto-flip: given a { headerName: 0-based index } map for whatever
  * table the edit landed in, flips that row's Manual_Override to "Manually
  * Edited" — unless the edit WAS to Manual_Override or Event_ID themselves.
@@ -2301,9 +2560,10 @@ function autoFlipManualOverride(sheet, headerMap0Based, editedRow, editedCol1Bas
 function handleRegistrantsEdit(e, sheet) {
   const zones = getSectionZones(sheet, 'Event_ID');
   const editedRow = e.range.getRow();
-  if (!isRowInAnyDataZone(zones, editedRow)) return;
+  const zone = findZoneForRow(zones, editedRow);
+  if (!zone) return;
 
-  const headerMap = getIndexMap(HEADERS.Lunch_and_Event_Registrants);
+  const headerMap = getLiveHeaderMap(sheet, zone.headerRow, HEADERS.Lunch_and_Event_Registrants);
   const editedCol = e.range.getColumn();
   autoFlipManualOverride(sheet, headerMap, editedRow, editedCol);
 
@@ -2331,9 +2591,10 @@ function handleRegistrantsEdit(e, sheet) {
 function handleLunchDashboardEdit(e, sheet) {
   const zones = getSectionZones(sheet, 'Standard_Buffer');
   const editedRow = e.range.getRow();
-  if (!isRowInAnyDataZone(zones, editedRow)) return;
+  const zone = findZoneForRow(zones, editedRow);
+  if (!zone) return;
 
-  const headerMap = getIndexMap(HEADERS.Master_Lunch_Dashboard);
+  const headerMap = getLiveHeaderMap(sheet, zone.headerRow, HEADERS.Master_Lunch_Dashboard);
   autoFlipManualOverride(sheet, headerMap, editedRow, e.range.getColumn());
 }
 
@@ -2890,21 +3151,20 @@ function refreshFormForNewDates(formId, group, locationName, configInfo) {
   const form = FormApp.openById(formId);
   const dates = group.events.map(ev => ev.getStartTime());
   const { allDateLabels, lunchDateLabels } = buildDateLabelSets(dates, locationName);
-  const lunchLabels = lunchDateLabels.length > 0 ? lunchDateLabels : ['No lunch served for any date on this form'];
 
-  form.setDescription(buildFormDescription(locationName, allDateLabels, group.isFixed));
+  form.setDescription(buildFormDescription(locationName, allDateLabels, group.isFixed, lunchDateLabels.length > 0));
 
-  // Catches a form that predates this location's policy being set to
-  // Never, or predates the policy feature entirely — removeLunchQuestionsFromForm()
-  // is a no-op once the questions are already gone, so this is cheap on
-  // every subsequent call.
-  if (getCateringPolicyForLocation(locationName) === CATERING_POLICIES.NEVER) {
-    removeLunchQuestionsFromForm(form, locationName);
-  }
+  // Catches a form that predates this location's policy being set to Never,
+  // or predates the policy feature entirely, and re-checks whether the dates
+  // now on the form serve lunch at all. Both directions are handled and both
+  // are no-ops once the form already matches, so this is cheap on every
+  // subsequent call.
+  const questionsChanged = syncLunchQuestionsOnForm(form, locationName, lunchDateLabels.length > 0);
 
-  // Only ROWS are refreshed here — grid COLUMNS (the person labels) are
-  // fixed per guest-count branch at template-build time and never touched again.
-  applyFormDateLabels(formId, allDateLabels, lunchLabels, { form, context: 'new dates on an existing form' });
+  // Only ROWS are refreshed here — grid COLUMNS (the person labels) are the
+  // same on every form and are set once at template-build time.
+  applyFormDateLabels(formId, allDateLabels, lunchDateLabels,
+    { form, force: questionsChanged > 0, context: 'new dates on an existing form' });
 
   return {
     formId: form.getId(),
@@ -2946,24 +3206,20 @@ function createRegistrationForm(group, locationName, configInfo) {
 
   const dates = group.events.map(ev => ev.getStartTime());
   const { allDateLabels, lunchDateLabels } = buildDateLabelSets(dates, locationName);
-  const lunchLabels = lunchDateLabels.length > 0 ? lunchDateLabels : ['No lunch served for any date on this form'];
 
-  form.setDescription(buildFormDescription(locationName, allDateLabels, group.isFixed));
+  form.setDescription(buildFormDescription(locationName, allDateLabels, group.isFixed, lunchDateLabels.length > 0));
 
-  // A location that never caters shouldn't be asking about lunch at all.
-  // Done on this fresh copy only — it's a structural edit, so it happens
-  // once at creation rather than on every refresh.
-  if (getCateringPolicyForLocation(locationName) === CATERING_POLICIES.NEVER) {
-    removeLunchQuestionsFromForm(form, locationName);
-  }
+  // A location that never caters — or a form none of whose dates serve lunch
+  // — shouldn't be asking about lunch at all.
+  syncLunchQuestionsOnForm(form, locationName, lunchDateLabels.length > 0);
 
   // Only ROWS are set here — grid COLUMNS (the person labels) were already
   // baked into the template. force:true because a fresh copy still carries
   // the template's placeholder rows even though this brand-new form ID has
   // no fingerprint on file yet.
-  applyFormDateLabels(form.getId(), allDateLabels, lunchLabels, { form, force: true, context: 'new form' });
-  form.getItems().filter(it => it.getTitle() === TEMPLATE_ITEM_TITLES.FOOTER)
-    .forEach(it => it.asSectionHeaderItem().setTitle(configInfo.footerNote));
+  applyFormDateLabels(form.getId(), allDateLabels, lunchDateLabels, { form, force: true, context: 'new form' });
+  applyFormFooterNote(form, configInfo.footerNote);
+  setFormTemplateVersion(form.getId(), TEMPLATE_VERSION);
 
   return {
     formId: form.getId(),
@@ -2971,6 +3227,13 @@ function createRegistrationForm(group, locationName, configInfo) {
     editUrl: form.getEditUrl(),
     dateLabels: allDateLabels
   };
+}
+
+/** Stamps the per-location note onto every copy of the template's FOOTER section header. */
+function applyFormFooterNote(form, footerNote) {
+  if (!footerNote) return;
+  form.getItems().filter(it => it.getTitle() === TEMPLATE_ITEM_TITLES.FOOTER)
+    .forEach(it => it.asSectionHeaderItem().setTitle(footerNote));
 }
 
 function writeEventRegistryRows(registrySheet, group, locationName, formInfo) {
@@ -3132,6 +3395,11 @@ function syncRegistrations() {
   });
 
   flushPersistentRegistries(); // one write for every all-dates entry recorded above
+
+  // Deliberately AFTER the import loop above: bringing a form built on an
+  // older template up to date replaces its questions, and a response that
+  // hadn't been imported yet would lose its answers with them.
+  migrateFormsToCurrentTemplate(registrySheet, sessionRows);
 
   // Catch up "sign up for all dates" registrants on Fixed-series forms
   // whose date list has grown since they originally registered.
@@ -3521,7 +3789,15 @@ function buildRegistrantRow(args) {
   // an actual Hot/Cold value. Deriving lunchStatus from this boolean rather
   // than from the resolved string means an unresolved Hot/Cold (no menu
   // configured yet) never downgrades a real "Needed" registrant.
-  const wantsLunch = !!lunchType && lunchType !== 'No Lunch';
+  //
+  // Gated on isLunchOfferedOn(): a date that serves no lunch produces no
+  // lunch demand, whatever the form said. The per-date roster grid can't
+  // even offer such a date (buildDateLabelSets() leaves it out), but the
+  // "everyone, every date" branch asks the lunch question ONCE for the whole
+  // form — without this gate, one checkbox would have booked a meal on every
+  // Not-Serving date the form covers.
+  const intendsLunch = !!lunchType && lunchType !== 'No Lunch';
+  const wantsLunch = intendsLunch && isLunchOfferedOn(registryEntry.eventDate, registryEntry.location);
 
   if (protectedKeys.has(key)) {
     return null; // never overwrite a manually-edited/added row, resubmission or not
@@ -3670,14 +3946,7 @@ function refreshFormCapacityLabelsForAllForms(registrySheet) {
   const rows = readAllSectionedRows(registrySheet, headers, 'Event_ID');
   if (rows.length === 0) return;
   const map = getIndexMap(headers);
-
-  const byForm = {};
-  rows.forEach(row => {
-    const formId = row[map['Form_ID']];
-    if (!formId) return;
-    if (!byForm[formId]) byForm[formId] = [];
-    byForm[formId].push(row);
-  });
+  const byForm = groupRegistryRowsByForm(rows, map);
 
   Object.keys(byForm).forEach(formId => {
     const formRows = byForm[formId];
@@ -3692,12 +3961,224 @@ function refreshFormCapacityLabelsForAllForms(registrySheet) {
     if (dates.length === 0) return;
     const capacityHints = buildCapacityHintsFromRegistryRows(formRows, map);
     const { allDateLabels, lunchDateLabels } = buildDateLabelSets(dates, location, capacityHints);
-    const lunchLabels = lunchDateLabels.length > 0 ? lunchDateLabels : ['No lunch served for any date on this form'];
     // Fingerprinted: on the overwhelmingly common "nothing filled up since
     // last hour" sync this costs a hash compare and no FormApp call at all.
-    applyFormDateLabels(formId, allDateLabels, lunchLabels, { context: 'capacity labels' });
+    applyFormDateLabels(formId, allDateLabels, lunchDateLabels, { context: 'capacity labels' });
   });
   flushPersistentRegistries();
+}
+
+/** { Form_ID: [session rows] } from a batch of Master_Program_Dashboard rows. Rows with no form are skipped. */
+function groupRegistryRowsByForm(rows, map) {
+  const byForm = {};
+  rows.forEach(row => {
+    const formId = row[map['Form_ID']];
+    if (!formId) return;
+    if (!byForm[formId]) byForm[formId] = [];
+    byForm[formId].push(row);
+  });
+  return byForm;
+}
+
+/**
+ * Is this live form built on the CURRENT template? Structural, not a
+ * version stamp — it has to be able to judge a form first seen long before
+ * stamps existed.
+ *
+ * A form is out of date when it still carries the v1/v2 guest-count question
+ * (and, behind it, that template's per-count branch pages), when it is
+ * missing the single Attendance Mode branch point, or when it has more page
+ * breaks than the current template's two. Any of those means a respondent is
+ * being routed by the old eight-section flow — the one that could answer
+ * "1 guest" and land on the 2-guest page.
+ */
+function isFormOnCurrentTemplate(form) {
+  const items = form.getItems();
+  const titles = items.map(it => it.getTitle());
+  if (titles.indexOf(LEGACY_GUEST_COUNT_TITLE) !== -1) return false;
+  if (titles.indexOf(TEMPLATE_ITEM_TITLES.ATTENDANCE_MODE) === -1) return false;
+  if (titles.indexOf(TEMPLATE_ITEM_TITLES.ATTENDANCE_GRID) === -1) return false;
+  const pageBreaks = items.filter(it => it.getType() === FormApp.ItemType.PAGE_BREAK).length;
+  return pageBreaks <= Object.keys(TEMPLATE_PAGE_TITLES).length;
+}
+
+/**
+ * Rewrites a live form's questions to the current template IN PLACE, keeping
+ * its Form ID.
+ *
+ * Keeping the ID is the whole point: every calendar description, dashboard
+ * link, registry entry, all-dates registrant record and label fingerprint in
+ * the system is keyed by it, and none of them have to be chased down. The
+ * cost is that responses already collected against the OLD questions lose
+ * their per-question answers when those questions are deleted — which is why
+ * this runs from syncRegistrations() only AFTER that run has imported
+ * everything new. Rows already on Lunch_and_Event_Registrants are the record
+ * of those registrations and are untouched.
+ */
+function rebuildFormFromCurrentTemplate(form, context) {
+  const items = form.getItems();
+  for (let i = items.length - 1; i >= 0; i--) {
+    form.deleteItem(items[i]);
+  }
+  addTemplateItemsToForm(form);
+
+  const { allDateLabels, lunchDateLabels } = buildDateLabelSets(context.dates, context.location, context.capacityHints);
+  form.setDescription(buildFormDescription(context.location, allDateLabels, context.isFixed, lunchDateLabels.length > 0));
+  syncLunchQuestionsOnForm(form, context.location, lunchDateLabels.length > 0);
+  // force: a rebuilt form's grids are back to the template placeholder row,
+  // and its fingerprint on file still describes the labels it had before.
+  applyFormDateLabels(form.getId(), allDateLabels, lunchDateLabels, { form, force: true, context: 'template migration' });
+  applyFormFooterNote(form, getFormFooterForLocation(context.location));
+  setFormTemplateVersion(form.getId(), TEMPLATE_VERSION);
+}
+
+/** Ceiling on how many out-of-date forms one execution will rebuild — see migrateFormsToCurrentTemplate(). */
+const MAX_FORM_REBUILDS_PER_RUN = 5;
+
+/**
+ * Brings every live registration form up to the current template.
+ *
+ * This is the missing half of a TEMPLATE_VERSION bump. Bumping it rebuilds
+ * the cached template, so forms created AFTERWARDS are correct — but a
+ * group's form is created once and then reused for as long as the group
+ * runs (see refreshFormForNewDates()), so the forms people are actually
+ * filling in stayed on whatever template they were born with. A respondent
+ * on a v1/v2 form still met the guest-count question and its branch pages,
+ * and still got mis-routed by them; the fix shipped in the template never
+ * reached them.
+ *
+ * Cheap by design: a form whose stamp already reads TEMPLATE_VERSION is
+ * skipped without any API call, so the steady state costs one Script
+ * Properties read. Only unstamped or stale forms are opened, and no more
+ * than MAX_FORM_REBUILDS_PER_RUN are rebuilt in any one execution — a
+ * rebuild is a few dozen Forms calls, and the hourly sync it rides on has a
+ * six-minute ceiling. Whatever is left over is picked up next run, so a
+ * backlog drains itself.
+ *
+ * Call AFTER responses have been imported — see rebuildFormFromCurrentTemplate().
+ * Returns the number of forms rebuilt.
+ */
+function migrateFormsToCurrentTemplate(registrySheet, sessionRows) {
+  const headers = HEADERS.Master_Program_Dashboard;
+  const rows = sessionRows || readAllSectionedRows(registrySheet, headers, 'Event_ID');
+  if (rows.length === 0) return 0;
+  const map = getIndexMap(headers);
+  const byForm = groupRegistryRowsByForm(rows, map);
+  const versions = getFormTemplateVersions();
+
+  const newUrlByFormId = {};
+  let rebuilt = 0;
+  let deferred = 0;
+
+  Object.keys(byForm).forEach(formId => {
+    if (versions[formId] === TEMPLATE_VERSION) return; // already known good — no API call
+    if (rebuilt >= MAX_FORM_REBUILDS_PER_RUN) { deferred++; return; }
+
+    let form;
+    try {
+      form = FormApp.openById(formId);
+    } catch (err) {
+      log(`⚠️ migrateFormsToCurrentTemplate: could not open form ${formId} (${err}).`);
+      noteForAdmin('Forms that could not be opened', `${formId} — ${err}`);
+      return;
+    }
+
+    if (isFormOnCurrentTemplate(form)) {
+      setFormTemplateVersion(formId, TEMPLATE_VERSION); // first sighting of an already-current form: just record it
+      return;
+    }
+
+    const formRows = byForm[formId];
+    const location = formRows[0][map['Location']];
+    const dates = formRows.map(r => coerceDate(r[map['Event_Date']])).filter(Boolean).sort((a, b) => a - b);
+    if (dates.length === 0) return;
+
+    try {
+      rebuildFormFromCurrentTemplate(form, {
+        location,
+        dates,
+        isFixed: formRows.some(r => r[map['Type_Tag']] === 'Fixed'),
+        capacityHints: buildCapacityHintsFromRegistryRows(formRows, map)
+      });
+    } catch (err) {
+      log(`⚠️ migrateFormsToCurrentTemplate: could not rebuild form ${formId} for "${location}" (${err}).`);
+      noteForAdmin('Forms that could not be updated',
+        `${formId} (${location}) still uses the old guest-count layout — rebuilding it failed with: ${err}`);
+      return;
+    }
+
+    rebuilt++;
+    newUrlByFormId[formId] = buildRegistrationUrl(form);
+    log(`Rebuilt form ${formId} ("${location}") on template v${TEMPLATE_VERSION} — the guest-count branch pages are gone.`);
+    noteForAdmin('Registration forms updated',
+      `"${form.getTitle()}" (${location}) was still on the old guest-count layout and has been rebuilt on the current one. ` +
+      `Its link is unchanged; the boxes it pre-checks are re-generated on the dashboard's "View Live Form" link, ` +
+      `and calendar invites pick the new one up the next time that program's dates change.`);
+  });
+
+  if (rebuilt > 0) updateRegistryFormLinks(registrySheet, newUrlByFormId);
+  if (deferred > 0) log(`${deferred} more form(s) still on an older template — they'll be rebuilt on the next sync.`);
+  flushPersistentRegistries();
+  return rebuilt;
+}
+
+/**
+ * Re-points Master_Program_Dashboard's "View Live Form" links at freshly
+ * generated URLs, for the forms in urlByFormId. Needed after a rebuild: the
+ * link we hand out is a PREFILLED url (buildRegistrationUrl()) whose
+ * entry.N parameters name the form's item IDs, and a rebuilt form has new
+ * ones. The stale link still opens the right form — Forms ignores parameters
+ * it doesn't recognize — it just stops pre-checking anything.
+ */
+function updateRegistryFormLinks(registrySheet, urlByFormId) {
+  if (Object.keys(urlByFormId).length === 0) return;
+  const headerRows = findProgramSessionHeaderRows(registrySheet);
+  if (headerRows.length === 0) return;
+  const sheetMap = getHeaderMapAt(registrySheet, headerRows[0]); // 1-based, read off the sheet itself
+
+  headerRows.forEach((hRow, i) => {
+    const nextHeader = (i + 1 < headerRows.length) ? headerRows[i + 1] : null;
+    const zone = getZoneDataRange(registrySheet, hRow, nextHeader, sheetMap['Event_Date']);
+    if (!zone) return;
+
+    const idValues = registrySheet.getRange(zone.start, sheetMap['Form_ID'], zone.count, 1).getValues();
+    const linkRange = registrySheet.getRange(zone.start, sheetMap['Form_Response_Link'], zone.count, 1);
+    const formulas = linkRange.getFormulas();
+    const values = linkRange.getValues();
+    const links = formulas.map((f, r) => [f[0] || values[r][0]]); // leave every other row exactly as it is
+    let touched = false;
+    idValues.forEach((idRow, r) => {
+      const url = urlByFormId[idRow[0]];
+      if (!url) return;
+      links[r] = [makeHyperlinkFormula(url, 'View Live Form')];
+      touched = true;
+    });
+    if (touched) linkRange.setValues(links);
+  });
+}
+
+/**
+ * MAINTENANCE — run from the Apps Script editor when a form needs
+ * re-checking right now rather than at the next hourly sync (which already
+ * calls migrateFormsToCurrentTemplate() itself), or after someone has hand-
+ * edited a form's questions, since the version stamps this clears are the
+ * only reason a form gets skipped without being opened.
+ *
+ * Returns the number of forms that were actually rebuilt.
+ */
+function recheckAllRegistrationForms() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const registrySheet = ss.getSheetByName(SHEET_NAMES.PROGRAM_DASHBOARD);
+  if (!registrySheet) return 0;
+
+  PropertiesService.getScriptProperties().deleteProperty(FORM_TEMPLATE_VERSION_PROP_KEY);
+  __formTemplateVersionCache = null;
+  __formTemplateVersionDirty = false;
+
+  const rebuilt = migrateFormsToCurrentTemplate(registrySheet);
+  flushAdminDigest('Form re-check');
+  log(`recheckAllRegistrationForms: rebuilt ${rebuilt} form(s) on template v${TEMPLATE_VERSION}.`);
+  return rebuilt;
 }
 
 /**
@@ -3801,7 +4282,12 @@ function getSectionZones(sheet, markerHeaderName) {
 }
 
 function isRowInAnyDataZone(zones, row) {
-  return zones.some(z => row >= z.dataStart && row <= z.dataEnd);
+  return findZoneForRow(zones, row) !== null;
+}
+
+/** The zone (from getSectionZones()) whose data rows contain `row`, or null. */
+function findZoneForRow(zones, row) {
+  return zones.filter(z => row >= z.dataStart && row <= z.dataEnd)[0] || null;
 }
 
 /**
@@ -3809,20 +4295,61 @@ function isRowInAnyDataZone(zones, row) {
  * (each with its own header row located via `markerHeaderName`) into one
  * combined array, preserving formulas. Banner/spacer rows are skipped
  * automatically since they never contain a parseable Event_Date.
+ *
+ * Rows come back in `headers` order even when the SHEET's own columns are in
+ * a different order — see buildHeaderProjection(). That is what lets a
+ * HEADERS entry be reordered (or gain/lose a column) without scrambling the
+ * data already sitting on the tab: the next render reads by header NAME and
+ * writes back out in the new order.
  */
 function readAllSectionedRows(sheet, headers, markerHeaderName) {
   const headerRows = findAllHeaderRows(sheet, markerHeaderName, 5000);
   if (headerRows.length === 0) return [];
   const lastRow = sheet.getLastRow();
+  const sheetLastCol = Math.max(sheet.getLastColumn(), headers.length);
   const dateColIdx = headers.indexOf('Event_Date');
   let combined = [];
   headerRows.forEach((hRow, i) => {
     const zoneEnd = (i + 1 < headerRows.length) ? headerRows[i + 1] - 1 : lastRow;
     if (zoneEnd <= hRow) return;
-    const rows = getRowsPreservingFormulas(sheet, hRow + 1, 1, zoneEnd - hRow, headers.length);
+    const projection = buildHeaderProjection(sheet, hRow, headers, sheetLastCol);
+    const numCols = projection ? sheetLastCol : headers.length;
+    let rows = getRowsPreservingFormulas(sheet, hRow + 1, 1, zoneEnd - hRow, numCols);
+    if (projection) rows = rows.map(row => projection.map(src => (src === -1 ? '' : row[src])));
     combined = combined.concat(dateColIdx >= 0 ? rows.filter(row => coerceDate(row[dateColIdx])) : rows);
   });
   return combined;
+}
+
+/**
+ * Compares a header ROW as it actually sits on the sheet against the header
+ * array the code expects.
+ *
+ * Returns null when they already line up column-for-column — the fast path,
+ * and the only case that ever ran before this existed. Otherwise returns a
+ * per-canonical-column array of 0-based SHEET column indexes (-1 for a
+ * column the sheet doesn't have yet), so readAllSectionedRows() can project
+ * each row into the expected order.
+ *
+ * This is what makes changing a HEADERS layout safe on a workbook that
+ * already holds data. Reordering the array used to silently reinterpret
+ * every stored row positionally — with Event_Date moving to column A, every
+ * existing registrant row would have been read with a Location string where
+ * its date belonged, failed the date filter, and been dropped on the next
+ * render.
+ */
+function buildHeaderProjection(sheet, headerRow, headers, lastCol) {
+  const rowValues = sheet.getRange(headerRow, 1, 1, lastCol).getValues()[0].map(normalizeHeaderText);
+  const alreadyAligned = headers.every((h, i) => rowValues[i] === h);
+  if (alreadyAligned) return null;
+
+  const colByName = {};
+  rowValues.forEach((name, i) => { if (name && colByName[name] === undefined) colByName[name] = i; });
+  const projection = headers.map(h => (colByName[h] === undefined ? -1 : colByName[h]));
+  const missing = headers.filter((h, i) => projection[i] === -1);
+  log(`Re-aligned "${sheet.getName()}" row ${headerRow} by header name` +
+    (missing.length > 0 ? ` (no column on the sheet yet for: ${missing.join(', ')})` : ''));
+  return projection;
 }
 
 /** Splits rows into { upcoming (today-or-later, ascending), past (before today, most-recent-first) }. Rows with no parseable date are treated as upcoming (kept visible). */
@@ -4658,9 +5185,17 @@ function writeMasterLunchDashboardSheet(sheet, plan, headers, fullTableRows, rol
   const notServingRule = buildTextEqualsRuleForRanges(typeRanges, 'Not Serving', NOT_SERVING_COLOR);
   if (notServingRule) rules.push(notServingRule);
 
-  const todayLocationRange = sheet.getRange(plan.todayDataStart, todayLocationCol, plan.numLocations, 1);
-  const scheduleLocationRanges = activeZones.map(z => sheet.getRange(z.start, locationCol, z.count, 1));
-  rules.push(...buildLocationColorRules([todayLocationRange, ...scheduleLocationRanges]));
+  // Location color-coding, painted across the row rather than on the single
+  // Location cell — this tab is one row per date PER LOCATION, so the block
+  // of color is what makes "everything for Ashbridge that week" scannable.
+  // Last in the rule list on purpose: the manual-override tint and the grey
+  // "Not Serving" cell above both need to win where they overlap.
+  activeZones.forEach(z => {
+    rules.push(...buildLocationRowTintRules(sheet, z.start, z.count, numCols, locationCol,
+      [map['Event_Date'] + 1, ...manualEntryColIndexes]));
+  });
+  rules.push(...buildLocationRowTintRules(sheet, plan.todayDataStart, plan.numLocations,
+    TODAY_LUNCH_HEADERS.length, todayLocationCol, []));
 
   sheet.setConditionalFormatRules(rules);
   autosizeColumns(sheet, { minCols: numCols });
