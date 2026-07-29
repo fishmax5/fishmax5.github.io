@@ -429,6 +429,8 @@ Under **🗓️ Calendar & Form Manager** at the top of the spreadsheet:
 | **Sync Registrations** | Pulls in new form responses, recomputes everything |
 | **Check Triggers** | Resets the automatic schedule to exactly the expected triggers — safe to press any time, clears out duplicates |
 | **Import Everything (First Run)** | The batched first import — see [First run](#first-run) |
+| **Find Leftover Tabs (preview)** | Read-only: reports old/stray tabs holding data — see [Leftover tabs](#leftover-tabs) |
+| **Merge + Delete Leftover Tabs** | Folds those tabs into the current ones, then removes them |
 | **Resize All Sheets** | Tidies column widths only — safe any time |
 
 You normally don't need these. Automatically:
@@ -465,6 +467,7 @@ say no:
 | Change `Type_Tag` on the program dashboard | It re-partitions that program across forms, and writes the tag onto every one of its calendar events |
 | Edit a **Lunch_Schedule** menu row | It rewrites the date labels on live forms, and can add/remove the lunch question |
 | Change **Lunch Service by Location** in Config | It decides whether that location's forms ask about lunch at all |
+| **Merge + Delete Leftover Tabs** | It deletes tabs (after moving their rows to safety) |
 
 For a cell edit, saying **no puts the old value straight back** — the cell
 reverts, nothing is left half-changed.
@@ -472,6 +475,44 @@ reverts, nothing is left half-changed.
 The **scheduled** runs (daily Sync Cal, hourly Sync Registrations) don't ask —
 there's nobody at the keyboard to answer, and doing their job on schedule is the
 point. Only a person clicking gets the question.
+
+---
+
+## Leftover tabs
+
+Over time a workbook collects tabs that hold real data but nothing reads any
+more:
+
+- `Active_Programs` — the session table's original name
+- `Lunch_Schedule_OLD_…` / `Config_OLD_…` — renamed automatically when an older
+  layout was found
+- `Copy of …`, `… (old)`, anything made by hand while troubleshooting
+
+Those rows are invisible to every sync and quietly rot. Two menu items deal
+with it:
+
+1. **Find Leftover Tabs (preview)** — read-only. Lists what it found, which
+   current tab each one matches, and how many rows are in it. Changes nothing,
+   so run it first.
+2. **Merge + Delete Leftover Tabs** — folds the rows in, then deletes the tabs.
+   It names every tab before doing anything and does nothing if you say no.
+
+**How it decides.** By the tab's **column headers**, not its name — so a tab
+called anything at all is handled, and a tab of your own notes is left alone
+(it needs a key column plus most of its columns to be recognizably ours). Old
+tabs with **fewer** columns, or columns in a different order, migrate correctly.
+
+**Existing rows always win.** A leftover row is added only if it isn't already
+there, so nothing current is ever overwritten by something older, and re-running
+is harmless. Merged rows get a note saying which tab they came from.
+
+**A tab is deleted only after its rows are safely written.** If anything fails,
+the tab stays put so you can try again. Deleted tabs are recoverable from
+**File > Version history** for a while.
+
+> You do **not** need this for ordinary column changes. When a tab's columns are
+> re-ordered or added to, the system re-aligns its existing rows by header name
+> automatically on the next sync.
 
 ---
 
@@ -486,10 +527,10 @@ the code:
 - `admin@newhorizonsseniorcenter.org`
 - `maxfishman@newhorizonsseniorcenter.org`
 
-**Gated:** Check Triggers, Import Everything (First Run), `initSheet()`,
-`cancelBootstrapCalendars()`, `confirmLargeTriage()`,
-`restoreTriagedRegistrants()`, `recheckAllRegistrationForms()`,
-`cleanupNeverPolicyForms()`.
+**Gated:** Check Triggers, Import Everything (First Run), Find Leftover Tabs,
+Merge + Delete Leftover Tabs, `initSheet()`, `cancelBootstrapCalendars()`,
+`confirmLargeTriage()`, `restoreTriagedRegistrants()`,
+`recheckAllRegistrationForms()`, `cleanupNeverPolicyForms()`.
 
 **Not gated, by design:** Sync Cal, Sync Registrations, Resize All Sheets, and
 everyone's ability to register, edit rows, and view every dashboard. Ordinary
