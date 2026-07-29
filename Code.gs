@@ -317,6 +317,86 @@ function log(msg) {
   if (ENABLE_LOGGING) console.log(msg);
 }
 
+
+// ============================================================================
+// 1a. ADMIN-ONLY GATE  (structural/destructive actions)
+// ============================================================================
+//
+// Apps Script installable triggers belong to whichever Google account
+// created them, invisibly to every other account — that's what let a second
+// person's "Check Triggers" click spawn a whole extra, undetectable set of
+// calendar-edit triggers (see writeTriggers()'s own doc comment). Resetting
+// triggers on every run fixes the symptom for whichever account presses the
+// button; this is the cause fix — keep the button out of reach of every
+// account except the ones meant to hold it.
+//
+// Gated here are the STRUCTURAL/DESTRUCTIVE entry points: anything that
+// rebuilds tabs, creates/deletes triggers, runs the multi-slice calendar
+// import, or overrides a safety limit. Left UNGATED on purpose: the routine
+// syncCalendars()/syncRegistrations() triggers and the onEdit/onOpen simple
+// triggers — those need to keep running no matter which account's session
+// happens to be open, and they already have their own safety nets (the
+// triage size limit, the bootstrap-active checks, sync-token priming).
+// ============================================================================
+
+/**
+ * Google accounts allowed to run a structural/destructive action. Edit this
+ * list to change who holds admin access — nothing else in the code needs to
+ * change. An empty list means NOBODY can (fails closed, not open).
+ */
+const AUTHORIZED_ADMIN_EMAILS = [
+  'admin@newhorizonsseniorcenter.org',
+  'maxfishman@newhorizonsseniorcenter.org'
+];
+
+/**
+ * The Google account this specific execution is running as. Session.getEffectiveUser()
+ * is who the code's side effects are attributed to — for a menu click or a
+ * direct editor run, that's whoever is signed in; for an installable trigger
+ * (the daily/hourly syncs, the bootstrap hand-off), it's whoever created that
+ * trigger, which is exactly "who actually set this in motion."
+ *
+ * Returns '' if it can't be determined (getEmail() can come back blank in
+ * some restricted execution contexts) — callers must treat that as
+ * unauthorized, not as a pass.
+ */
+function getCurrentUserEmail() {
+  try {
+    return String(Session.getEffectiveUser().getEmail() || '').trim().toLowerCase();
+  } catch (err) {
+    return '';
+  }
+}
+
+function isAuthorizedAdmin() {
+  const email = getCurrentUserEmail();
+  if (!email) return false;
+  return AUTHORIZED_ADMIN_EMAILS.some(allowed => allowed.trim().toLowerCase() === email);
+}
+
+/**
+ * Call as the FIRST line of any structural/destructive function. Returns
+ * true and does nothing else if the current account is authorized; returns
+ * false (having logged and toasted why) otherwise — the caller's very next
+ * line should be `return`.
+ *
+ * FAILS CLOSED: an email that can't be determined is treated as
+ * unauthorized, same as a real mismatch. The cost of a false block is
+ * someone re-running it after signing in as the right account; the cost of
+ * a false pass is an unidentified account rebuilding triggers or running the
+ * calendar import.
+ */
+function requireAuthorizedAdmin(actionName) {
+  if (isAuthorizedAdmin()) return true;
+  const email = getCurrentUserEmail();
+  const whoami = email ? `you're signed in as ${email}` : `your account could not be identified`;
+  const message = `⛔ "${actionName}" is restricted to: ${AUTHORIZED_ADMIN_EMAILS.join(', ')} — ${whoami}. ` +
+    `Ask one of those accounts to run it, or switch to one of them.`;
+  log(message);
+  toastIfPossible(message);
+  return false;
+}
+
 /** Calendar ID -> human-readable location name. */
 const CALENDAR_MAP = {
   'c_a1a2cd2f999f1bed82d1f21c59a1cb381485a28297a3ff1b8d394e2ad5fdc282@group.calendar.google.com': 'Narberth',
@@ -1890,6 +1970,7 @@ function refreshFormsForChangedLunchDate(changedDate, location) {
 // ============================================================================
 
 function initSheet() {
+  if (!requireAuthorizedAdmin('Initialize sheet setup')) return;
   const ss = SpreadsheetApp.getActiveSpreadsheet();
 
   const legacySheet = ss.getSheetByName(LEGACY_ACTIVE_PROGRAMS_SHEET_NAME);
@@ -2498,6 +2579,10 @@ function onOpen() {
  * hourly registration sync, which then imports any existing responses).
  */
 function initializeAndSyncAll() {
+  // Checked here too, not just inside initSheet()/bootstrapCalendars(): both
+  // of those would otherwise fire their OWN rejection back to back, and the
+  // log line after them ("setup done...") would run regardless and lie.
+  if (!requireAuthorizedAdmin('Initialize + Sync Everything')) return;
   initSheet();
   bootstrapCalendars();
   log('initializeAndSyncAll: setup done; the calendar import continues in the background.');
@@ -2547,6 +2632,7 @@ function initializeAndSyncAll() {
  * genuinely done.
  */
 function writeTriggers(force) {
+  if (!requireAuthorizedAdmin('Check Triggers')) return;
   if (!force && isBootstrapActive()) {
     const message = `Triggers stay paused until the large-setup import finishes — it restores them itself.`;
     log(`writeTriggers: ${message}`);
@@ -3501,6 +3587,7 @@ function isBootstrapActive() {
  * recover after a sync that timed out half-finished.
  */
 function bootstrapCalendars() {
+  if (!requireAuthorizedAdmin('Import Everything (First Run)')) return;
   if (isBootstrapActive()) {
     const state = getBootstrapState();
     const message = `A large-setup import is already running (slice ${state.slices} of at most ${BOOTSTRAP_MAX_SLICES}) — leaving it alone.`;
@@ -3739,6 +3826,7 @@ function deleteBootstrapResumeTriggers() {
  * from there.
  */
 function cancelBootstrapCalendars() {
+  if (!requireAuthorizedAdmin('Cancel Large-Setup Import')) return;
   const state = getBootstrapState();
   if (!state) {
     deleteBootstrapResumeTriggers();
@@ -4004,6 +4092,7 @@ function moveRegistrantsToTriage(registrantsSheet, deletedEventInfo) {
  * Run from the Apps Script editor. Returns the number of rows restored.
  */
 function restoreTriagedRegistrants() {
+  if (!requireAuthorizedAdmin('Restore Triaged Registrants')) return 0;
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const triageSheet = ss.getSheetByName(SHEET_NAMES.TRIAGE);
   const registrySheet = ss.getSheetByName(SHEET_NAMES.PROGRAM_DASHBOARD);
@@ -4951,6 +5040,7 @@ function updateRegistryFormLinks(registrySheet, urlByFormId) {
  * Returns the number of forms that were actually rebuilt.
  */
 function recheckAllRegistrationForms() {
+  if (!requireAuthorizedAdmin('Re-check All Registration Forms')) return 0;
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const registrySheet = ss.getSheetByName(SHEET_NAMES.PROGRAM_DASHBOARD);
   if (!registrySheet) return 0;
@@ -4979,6 +5069,7 @@ function recheckAllRegistrationForms() {
  * changes nothing.
  */
 function cleanupNeverPolicyForms() {
+  if (!requireAuthorizedAdmin('Cleanup Never-Policy Forms')) return;
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const registrySheet = ss.getSheetByName(SHEET_NAMES.PROGRAM_DASHBOARD);
   if (!registrySheet) return;
@@ -5535,6 +5626,7 @@ function isTriageTooBig(deletedCount, totalRows) {
  * that the sessions really are gone from the calendar.
  */
 function confirmLargeTriage() {
+  if (!requireAuthorizedAdmin('Confirm Large Triage')) return;
   PropertiesService.getScriptProperties().setProperty(TRIAGE_OVERRIDE_PROP_KEY, String(Date.now()));
   log(`confirmLargeTriage: the next sweep may exceed ${TRIAGE_MAX_SESSIONS_PER_RUN} sessions. ` +
     `Run "Sync Cal" to trigger it — the permission is used up by that one sweep.`);

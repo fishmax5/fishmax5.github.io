@@ -337,7 +337,55 @@ You normally don't need these. Automatically:
 
 Press a menu item when you want something *now* instead of waiting.
 
+> **Check Triggers** and **Import Everything** only work for the account(s)
+> listed in `AUTHORIZED_ADMIN_EMAILS` in the code (currently
+> `admin@newhorizonsseniorcenter.org` and
+> `maxfishman@newhorizonsseniorcenter.org`). Anyone else clicking them gets a
+> toast explaining that and nothing happens — see
+> [Admin-only actions](#admin-only-actions) below. **Sync Cal**, **Sync
+> Registrations**, and **Resize All Sheets** are open to everyone.
+
 > If the menu isn't there, reload the spreadsheet page.
+
+---
+
+## Admin-only actions
+
+A handful of actions restructure the workbook or the project's automation
+itself — rebuilding every tab, creating/deleting triggers, running the
+multi-hour first import, or overriding a safety limit. Those are restricted to
+specific Google accounts, listed in `AUTHORIZED_ADMIN_EMAILS` near the top of
+the code:
+
+- `admin@newhorizonsseniorcenter.org`
+- `maxfishman@newhorizonsseniorcenter.org`
+
+**Gated:** Check Triggers, Import Everything (First Run), `initSheet()`,
+`cancelBootstrapCalendars()`, `confirmLargeTriage()`,
+`restoreTriagedRegistrants()`, `recheckAllRegistrationForms()`,
+`cleanupNeverPolicyForms()`.
+
+**Not gated, by design:** Sync Cal, Sync Registrations, Resize All Sheets, and
+everyone's ability to register, edit rows, and view every dashboard. Ordinary
+day-to-day use needs no special account.
+
+If someone outside that list runs a gated action, nothing happens — no tabs
+rebuilt, no triggers touched, no data changed — and they see a toast (and the
+log gets a line starting with ⛔) naming which accounts are allowed. There's
+no partial effect to clean up.
+
+**Why this exists:** an installable trigger in Apps Script belongs privately
+to whichever Google account created it — one account's code can't even see
+another's triggers, let alone remove them. Before this restriction, two
+people each pressing "Check Triggers" from their own logins built two
+separate, mutually invisible sets of calendar-watch triggers that both fired
+on every edit forever. Restricting who can press that button is the fix at
+the cause; see **Troubleshooting**, "The same event seems to trigger a sync
+twice," for the recovery steps if this already happened to you.
+
+**To change who's on the list:** edit `AUTHORIZED_ADMIN_EMAILS` in the Apps
+Script editor and save — no other code needs to change. Keep at least one
+address on it; an empty list locks everyone out, including you.
 
 ---
 
