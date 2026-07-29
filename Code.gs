@@ -61,9 +61,13 @@
  *    - EVENT GRAMMAR — the TITLE is just the program name; every SETTING
  *      lives in the event DESCRIPTION, in brackets:
  *        Title "Yoga Basics"           + description "[Cap: 12]"  -> capped at 12
- *        Title "Yoga Basics"           + description "[Fixed]"    -> one continuous
+ *        Title "Yoga Basics"           + description "[Grouped]"  -> one continuous
  *          series with ONE form, instead of a separate form per month
- *        description "[Cap: 12, Fixed]" or "[Cap: 12] [Fixed]"    -> both
+ *        Title "Yoga Basics"           + description "[Monthly]"  -> a form per
+ *          calendar month (the default, so this is only ever explicit intent)
+ *        description "[Cap: 12, Grouped]" or "[Cap: 12] [Grouped]" -> both
+ *      [Fixed] and [Regular] are still read as [Grouped] / [Monthly], so no
+ *      existing calendar description needs editing — see EVENT_TYPES.
  *      A title is what attendees read on a shared calendar, so scheduling
  *      jargon does not belong there. Brackets left in a TITLE are still
  *      honored as a legacy fallback (and logged) so existing calendars keep
@@ -115,11 +119,11 @@
  *      sync covering only things needing a human — waitlisted registrants,
  *      forms that couldn't be opened, events sent to triage. A sync with
  *      nothing to report sends nothing. Blank address = disabled.
- *    - ONE FORM TEMPLATE, ONE BRANCH POINT. Every group — Fixed or Regular
+ *    - ONE FORM TEMPLATE, ONE BRANCH POINT. Every group — Grouped or Monthly
  *      — is built from the same template, and "Attendance Mode" is now on
  *      every form:
  *        "Everyone, every date"          -> one checkbox of who eats, applied
- *          to every session date, including dates added to a Fixed series
+ *          to every session date, including dates added to a Grouped series
  *          afterward (see the ALL_DATES registry + applyAllDatesCatchup()).
  *        "Let me pick specific dates/people" -> the two roster grids,
  *          "Who is Attending Each Date?" and "Who Needs Lunch Each Date?",
@@ -397,6 +401,77 @@ function requireAuthorizedAdmin(actionName) {
   return false;
 }
 
+
+// ============================================================================
+// 1b. "ARE YOU SURE?" — consequence prompts for outward-facing changes
+// ============================================================================
+//
+// Some edits in this workbook don't just change the workbook: they rewrite
+// LIVE Google Forms that people are mid-way through registering on, or change
+// what every future registration is catered as. A spreadsheet gives no hint
+// that typing in a cell is about to do that.
+//
+// So the rule is: anything whose blast radius reaches outside this
+// spreadsheet asks first, in plain language, and does nothing at all if the
+// answer is no. For a cell edit that means putting the old value BACK, since
+// by the time onEdit sees it the new value is already on the sheet.
+//
+// getUi() is unavailable in a trigger context (a time-driven sync has no
+// dialog to show), which is exactly right: an unattended run should proceed
+// on its schedule, not sit waiting for a click that will never come. Only a
+// human at the keyboard gets asked.
+// ============================================================================
+
+/**
+ * Asks the user to confirm a consequential action. Returns true to proceed.
+ *
+ * NO UI AVAILABLE (a trigger run) => returns `defaultWhenUnattended`, which
+ * callers must choose deliberately:
+ *   - true  for automation that SHOULD keep running unattended (the hourly
+ *           sync rewriting form labels — that's its job).
+ *   - false for anything a human specifically set in motion, where silence
+ *           means nobody is there to take responsibility for it.
+ */
+function confirmConsequentialAction(title, detail, defaultWhenUnattended) {
+  let ui;
+  try {
+    ui = SpreadsheetApp.getUi();
+  } catch (err) {
+    log(`No UI available to confirm "${title}" — ${defaultWhenUnattended ? 'proceeding' : 'skipping'} (unattended run).`);
+    return !!defaultWhenUnattended;
+  }
+  if (!ui) return !!defaultWhenUnattended;
+
+  const response = ui.alert(title, `${detail}\n\nContinue?`, ui.ButtonSet.YES_NO);
+  const proceed = response === ui.Button.YES;
+  log(`"${title}": user chose ${proceed ? 'YES — proceeding' : 'NO — nothing changed'}.`);
+  if (!proceed) toastIfPossible(`Cancelled — nothing was changed.`);
+  return proceed;
+}
+
+/**
+ * The cell-edit flavour: confirm, and PUT THE OLD VALUE BACK if declined.
+ * `e` is the onEdit event, which carries oldValue for a single-cell edit.
+ *
+ * Multi-cell edits (a paste, a fill-down) have no oldValue to restore, so
+ * they are allowed through with a warning toast rather than being reverted to
+ * a guess — silently writing the wrong "old" value into a range would be
+ * worse than the edit itself.
+ */
+function confirmCellEditOrRevert(e, title, detail) {
+  const isSingleCell = e && e.range && e.range.getNumRows() === 1 && e.range.getNumColumns() === 1;
+  if (!isSingleCell) {
+    toastIfPossible(`⚠️ ${title}: applied to a multi-cell edit without asking — please double-check the result.`);
+    return true;
+  }
+  if (confirmConsequentialAction(title, detail, false)) return true;
+
+  // Declined: restore what was there. e.oldValue is undefined when the cell
+  // was previously empty, which setValue('') reproduces correctly.
+  e.range.setValue(e.oldValue === undefined ? '' : e.oldValue);
+  return false;
+}
+
 /** Calendar ID -> human-readable location name. */
 const CALENDAR_MAP = {
   'c_a1a2cd2f999f1bed82d1f21c59a1cb381485a28297a3ff1b8d394e2ad5fdc282@group.calendar.google.com': 'Narberth',
@@ -490,7 +565,55 @@ const MANUAL_OVERRIDE_OPTIONS = ['Auto-Synced', 'Manually Edited', 'Manually Add
 // needing any special-casing there.
 const PROGRAM_STATUS_OPTIONS = ['Active', 'Waitlisted', 'Cancelled', 'Superseded'];
 const LUNCH_STATUS_OPTIONS = ['Needed', 'No Lunch', 'Waitlisted', 'Cancelled', 'Superseded'];
-const EVENT_TYPE_OPTIONS = ['Fixed', 'Regular'];
+/**
+ * What a program's Type_Tag says about how its sessions are grouped onto ONE
+ * registration form:
+ *
+ *   GROUPED  every session of the series shares a single form, however many
+ *            months it spans. Was called "Fixed".
+ *   MONTHLY  sessions are bundled per calendar month — a new month means a
+ *            new form. Was called "Regular".
+ *
+ * The old words said nothing about what actually differs (both are "regular"
+ * in plain English, and a "Fixed" series isn't fixed in any sense a user
+ * would guess). The mechanism is unchanged — only the vocabulary.
+ *
+ * BOTH SPELLINGS ARE READ EVERYWHERE, forever: normalizeTypeTag() maps
+ * Fixed->Grouped and Regular->Monthly, so session rows written by earlier
+ * versions, and `[Fixed]` still sitting in a calendar description, keep
+ * working with no migration step. Only what this script WRITES changes.
+ */
+const EVENT_TYPES = {
+  GROUPED: 'Grouped',
+  MONTHLY: 'Monthly'
+};
+const EVENT_TYPE_OPTIONS = [EVENT_TYPES.GROUPED, EVENT_TYPES.MONTHLY];
+
+/** Legacy Type_Tag spellings -> current ones. */
+const LEGACY_EVENT_TYPE_ALIASES = {
+  fixed: EVENT_TYPES.GROUPED,
+  regular: EVENT_TYPES.MONTHLY
+};
+
+/**
+ * Canonical Type_Tag for a value read from a sheet, a description, or
+ * anywhere else. Unrecognized input falls back to MONTHLY — the narrower
+ * grouping, so a typo can never silently merge unrelated months onto one
+ * form.
+ */
+function normalizeTypeTag(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return EVENT_TYPES.MONTHLY;
+  const lower = raw.toLowerCase();
+  if (LEGACY_EVENT_TYPE_ALIASES[lower]) return LEGACY_EVENT_TYPE_ALIASES[lower];
+  const match = EVENT_TYPE_OPTIONS.filter(t => t.toLowerCase() === lower)[0];
+  return match || EVENT_TYPES.MONTHLY;
+}
+
+/** True when this Type_Tag means "one form for the whole series" (either spelling). */
+function isGroupedTypeTag(value) {
+  return normalizeTypeTag(value) === EVENT_TYPES.GROUPED;
+}
 
 /**
  * One color per location, used BOTH for the Location cell itself and (on
@@ -711,7 +834,7 @@ const TEMPLATE_ITEM_TITLES = {
   ALL_DATES_LUNCH_PEOPLE: 'Who Needs Lunch? (Applies to Every Date)'
 };
 
-/** The two choices on the Attendance Mode question — now on EVERY form, not just Fixed series. */
+/** The two choices on the Attendance Mode question — now on EVERY form, not just Grouped series. */
 const ATTENDANCE_MODE_CHOICES = {
   ALL_DATES: 'Everyone, every date',
   INDIVIDUAL: 'Let me pick specific dates/people'
@@ -763,7 +886,7 @@ const TEMPLATE_GRID_PLACEHOLDER_ROW = '(dates will be filled in automatically)';
  *
  *   "Everyone, Every Date"   ALL_DATES_LUNCH_PEOPLE checkbox (who eats, applied
  *                            to every session date, including dates added to a
- *                            Fixed series later) -> SUBMIT
+ *                            Grouped series later) -> SUBMIT
  *
  *   "Specific Dates"         ATTENDANCE_GRID + LUNCH_GRID roster grids, dates as
  *                            rows and PERSON_COLUMN_LABELS as columns -> SUBMIT
@@ -872,7 +995,7 @@ function addLunchGridItem(form) {
  * Builds the form description, including the exact dates being registered
  * for — one date per line, not one long semicolon-separated line. Adds a
  * note when any date is lunch-free, and a tip about the "all dates" option
- * for Fixed-series forms.
+ * for Grouped-series forms.
  */
 function buildFormDescription(locationName, dateLabels, isFixed, hasLunchDates) {
   const dateList = dateLabels.map(label => `• ${label}`).join('\n');
@@ -931,7 +1054,7 @@ function savePersistentFormRegistryEntry(groupKey, formId) {
 
 /**
  * Persistent registry of "sign up for all dates" respondents, keyed by
- * Form_ID, so that when a Fixed-series form later gains NEW dates (the
+ * Form_ID, so that when a Grouped-series form later gains NEW dates (the
  * series keeps running), syncRegistrations() can retroactively add rows
  * for those new dates for everyone who originally chose "all dates" —
  * otherwise "all dates" would silently only mean "all dates that existed
@@ -1824,7 +1947,7 @@ function removeLunchQuestionsFromForm(form, locationName, reason) {
 
 /**
  * The inverse of removeLunchQuestionsFromForm(): puts a stripped lunch
- * question back when lunch returns to a form (a Fixed series that gains its
+ * question back when lunch returns to a form (a Grouped series that gains its
  * first catered date, a menu row added to a By-exception location). Without
  * this, "hide the question when there's nothing to eat" would be a one-way
  * door on a form that outlives the dates it was created with.
@@ -2740,10 +2863,164 @@ function onEdit(e) {
       handleLunchDashboardEdit(e, sheet);
     } else if (name === SHEET_NAMES.LUNCH_SCHEDULE) {
       handleLunchScheduleEdit(e, sheet);
+    } else if (name === SHEET_NAMES.PROGRAM_DASHBOARD) {
+      handleProgramDashboardEdit(e, sheet);
+    } else if (name === SHEET_NAMES.CONFIG) {
+      handleConfigEdit(e, sheet);
     }
   } catch (err) {
     log(`onEdit error: ${err}`);
   }
+}
+
+/**
+ * Master_Program_Dashboard: the session table is rebuilt from the calendar on
+ * every render, so almost nothing typed here survives — EXCEPT Type_Tag,
+ * which decides how sessions are grouped onto forms and is a real, outward-
+ * facing decision.
+ *
+ * Changing Grouped <-> Monthly re-partitions a program's sessions across
+ * forms: Monthly means one form per calendar month, Grouped means one form for
+ * the whole series. Applying that means the next sync builds different forms
+ * and injects different links into the calendar — so it asks first, reverts
+ * the cell on "no", and on "yes" writes the tag back into the calendar
+ * DESCRIPTION (the actual source of truth, see resolveEventSettings()) so the
+ * change survives the next render instead of being overwritten by it.
+ */
+function handleProgramDashboardEdit(e, sheet) {
+  const zones = getSectionZones(sheet, 'Event_ID');
+  const editedRow = e.range.getRow();
+  const zone = findZoneForRow(zones, editedRow);
+  if (!zone) return;
+
+  const headerMap = getLiveHeaderMap(sheet, zone.headerRow, HEADERS.Master_Program_Dashboard);
+  const typeCol = headerMap['Type_Tag'];
+  if (typeCol === undefined || e.range.getColumn() !== typeCol + 1) return;
+  if (typeof e.value === 'undefined') return; // multi-cell paste — nothing single to reason about
+
+  const newTag = normalizeTypeTag(e.value);
+  const oldTag = normalizeTypeTag(e.oldValue);
+  if (newTag === oldTag) return;
+
+  const title = String(sheet.getRange(editedRow, (headerMap['Clean_Title'] || 0) + 1).getValue() || 'this program');
+  const detail = newTag === EVENT_TYPES.GROUPED
+    ? `"${title}" will switch to ONE shared registration form for its whole series, ` +
+      `instead of a separate form each month.\n\nThe next sync will build that form and update the ` +
+      `registration link on every one of its calendar events.`
+    : `"${title}" will switch to a SEPARATE registration form per calendar month, ` +
+      `instead of one form for the whole series.\n\nThe next sync will build those forms and update the ` +
+      `registration link on every one of its calendar events.`;
+
+  if (!confirmCellEditOrRevert(e, `Change ${title} to "${newTag}"?`, detail)) return;
+
+  const stamped = writeTypeTagToCalendarEvents(sheet, editedRow, headerMap, newTag);
+  toastIfPossible(stamped > 0
+    ? `Set "${title}" to ${newTag} on ${stamped} calendar event(s) — run Sync Cal to rebuild its form(s).`
+    : `⚠️ Set "${title}" to ${newTag} on the sheet, but no calendar event could be updated — ` +
+      `the next render may revert it. Set [${newTag}] in the event description by hand.`);
+}
+
+/**
+ * Writes [Grouped]/[Monthly] into the DESCRIPTION of every calendar event
+ * belonging to the same program as `editedRow`, replacing whichever grouping
+ * bracket was there.
+ *
+ * The description is where resolveEventSettings() reads this from, so this is
+ * what makes a Type_Tag edit stick. Without it the cell would read "Grouped"
+ * until the next render recomputed it from the calendar and quietly put
+ * "Monthly" back — the classic "my change didn't save" bug.
+ *
+ * Scope is program + location (every session sharing Clean_Title and
+ * Calendar_Source), not just the edited row: grouping is a property of the
+ * program, and leaving its other sessions disagreeing would split it across
+ * both groupings at once. That's the "unite disparate monthly events" case.
+ */
+function writeTypeTagToCalendarEvents(sheet, editedRow, headerMap, newTag) {
+  const title = String(sheet.getRange(editedRow, (headerMap['Clean_Title'] || 0) + 1).getValue() || '').trim();
+  const calendarId = String(sheet.getRange(editedRow, (headerMap['Calendar_Source'] || 0) + 1).getValue() || '').trim();
+  if (!title || !calendarId) return 0;
+
+  const { start, end } = computeSyncDateRange();
+  const eventsByCalendar = getCalendarEventsForWindow(start, end);
+  const events = eventsByCalendar[calendarId];
+  if (!events) {
+    log(`⚠️ Type_Tag change for "${title}": calendar ${calendarId} could not be read — nothing stamped.`);
+    return 0;
+  }
+
+  let stamped = 0;
+  events.forEach(ev => {
+    if (ev.isAllDayEvent()) return;
+    const parsed = parseEventTitle(ev.getTitle());
+    if (!parsed || parsed.cleanTitle !== title) return;
+
+    const existing = ev.getDescription() || '';
+    const updated = setGroupingBracketInDescription(existing, newTag);
+    if (updated === existing) return;
+    ev.setDescription(updated);
+    stamped++;
+  });
+
+  if (stamped > 0) {
+    invalidateCalendarEventsCache(); // descriptions just changed under the cache
+    log(`Stamped [${newTag}] onto ${stamped} calendar event(s) for "${title}".`);
+  }
+  return stamped;
+}
+
+/**
+ * Returns `description` with any grouping bracket ([Grouped]/[Monthly], or the
+ * legacy [Fixed]/[Regular]) replaced by [newTag] — preserving [Cap: N] and any
+ * unrelated bracketed notes, and appending the tag if none was present.
+ */
+function setGroupingBracketInDescription(description, newTag) {
+  const raw = String(description || '');
+  const groupingWord = /^\s*(Grouped|Fixed|Monthly|Regular)\s*$/i;
+  let replaced = false;
+
+  // Rewrite brackets that ONLY hold a grouping word; leave mixed brackets
+  // like [Cap: 12, Grouped] to the combined-content branch below.
+  let out = raw.replace(/\[([^\]]*)\]/g, (whole, content) => {
+    if (groupingWord.test(content)) { replaced = true; return `[${newTag}]`; }
+    if (/\b(Grouped|Fixed|Monthly|Regular)\b/i.test(content)) {
+      replaced = true;
+      const kept = content
+        .split(',')
+        .map(part => part.trim())
+        .filter(part => part && !groupingWord.test(part));
+      return `[${kept.concat(newTag).join(', ')}]`;
+    }
+    return whole;
+  });
+
+  if (!replaced) out = raw ? `${raw.replace(/\s*$/, '')}\n[${newTag}]` : `[${newTag}]`;
+  return out;
+}
+
+/**
+ * Config: these cells change how every FUTURE registration is interpreted —
+ * a catering policy decides whether a location is asked about lunch at all,
+ * and buffers/order-ahead feed the numbers staff order against. Worth a
+ * confirmation, and worth invalidating the caches built from them.
+ */
+function handleConfigEdit(e, sheet) {
+  if (typeof e.value === 'undefined') return; // multi-cell paste
+  const editedCol = e.range.getColumn();
+  const policySection = CONFIG_LAYOUT.CATERING_POLICY;
+  const isPolicyEdit = editedCol === policySection.startCol + 1 &&
+    e.range.getRow() >= CONFIG_DATA_START_ROW;
+
+  if (isPolicyEdit) {
+    const location = String(sheet.getRange(e.range.getRow(), policySection.startCol).getValue() || 'this location');
+    const detail = `Lunch service for "${location}" becomes "${e.value}".\n\n` +
+      `This changes whether its registration forms ask about lunch at all, and whether its dates ` +
+      `appear on the lunch dashboard. Existing forms are updated on the next sync.`;
+    if (!confirmCellEditOrRevert(e, `Change lunch service for ${location}?`, detail)) return;
+    toastIfPossible(`Lunch service for ${location} set to "${e.value}" — forms update on the next sync.`);
+  }
+
+  // Any Config edit can invalidate a cached read of it, confirmed or not.
+  invalidateConfigCaches();
 }
 
 /**
@@ -3080,15 +3357,21 @@ function computeSyncDateRange() {
 /** A leading "*" on the title marks an event TENTATIVE — see parseEventTitle(). */
 const TENTATIVE_TITLE_PREFIX = '*';
 
-/** Every bracketed group in a string: "[Cap: 12] [Fixed]" and "[Cap: 12, Fixed]" both work. */
+/** Every bracketed group in a string: "[Cap: 12] [Grouped]" and "[Cap: 12, Grouped]" both work. */
 const BRACKET_GROUP_REGEX = /\[([^\]]*)\]/g;
 
 /**
  * Pulls the settings this system understands out of any bracketed groups
  * in a blob of text:
- *   [Cap: 12]          -> capacity 12
- *   [Fixed]            -> one continuous series rather than month buckets
- *   [Cap: 12, Fixed]   -> both, one bracket
+ *   [Cap: 12]            -> capacity 12
+ *   [Grouped]            -> one form for the whole series (see EVENT_TYPES)
+ *   [Monthly]            -> one form per calendar month (the default anyway)
+ *   [Cap: 12, Grouped]   -> both, one bracket
+ *
+ * [Fixed] is still read as [Grouped] and [Regular] as [Monthly], so
+ * descriptions written before the rename keep working untouched — there is
+ * nothing to go back and edit.
+ *
  * Unrecognized bracket contents are ignored, so people can bracket other
  * notes in a description without confusing anything.
  */
@@ -3104,7 +3387,12 @@ function parseSettingsBrackets(text) {
     const content = match[1] || '';
     const capMatch = /Cap:\s*(\d+)/i.exec(content);
     if (capMatch) { capacity = parseInt(capMatch[1], 10); sawAny = true; }
-    if (/\bFixed\b/i.test(content)) { isFixed = true; sawAny = true; }
+    // "Grouped" is the current word, "Fixed" the one it replaced — both mean
+    // "one form for the whole series." An explicit [Monthly]/[Regular] is
+    // recognized too, purely so it counts as sawAny (a deliberate statement
+    // of the default) rather than reading as an unrecognized note.
+    if (/\b(Grouped|Fixed)\b/i.test(content)) { isFixed = true; sawAny = true; }
+    if (/\b(Monthly|Regular)\b/i.test(content)) { sawAny = true; }
   }
   return { capacity, isFixed, sawAny };
 }
@@ -3115,7 +3403,7 @@ function parseSettingsBrackets(text) {
  *   "Yoga Basics"    -> a program
  *   "*Yoga Basics"   -> the same program, TENTATIVE (see below)
  *
- * BOTH capacity and Fixed-vs-Regular now live in the event DESCRIPTION —
+ * BOTH capacity and Grouped-vs-Monthly now live in the event DESCRIPTION —
  * see parseSettingsBrackets() / resolveEventSettings(). The title is what
  * attendees read on a shared calendar, and "[Cap: 12, Fixed]" there is
  * internal scheduling jargon. Brackets left in a title are still read as a
@@ -3171,7 +3459,7 @@ function resolveEventSettings(event, parsedTitle) {
 
   if (parsedTitle.hasLegacyBrackets && !fromDescription.sawAny) {
     log(`ℹ️ "${parsedTitle.cleanTitle}" still carries its settings in the TITLE. That still works, but the supported ` +
-      `place is now the event DESCRIPTION — move "[Cap: N]" / "[Fixed]" there and drop them from the title.`);
+      `place is now the event DESCRIPTION — move "[Cap: N]" / "[Grouped]" there and drop them from the title.`);
   }
   return { capacity, isFixed };
 }
@@ -3407,14 +3695,14 @@ function processCalendarGroup(registrySheet, item, existingState) {
   return { formCreated, eventsAdded: newEvents.length };
 }
 
-/** Groups parsed calendar events into Fixed-series or monthly-chunk buckets. */
+/** Groups parsed calendar events into Grouped-series or per-month buckets. */
 function buildEventGroups(parsedEvents, calendarId) {
   const groups = {};
 
   parsedEvents.forEach(({ ev, parsed }) => {
     const startTime = ev.getStartTime();
     const monthLabel = getMonthLabel(startTime);
-    const typeTag = parsed.isFixed ? 'Fixed' : 'Regular';
+    const typeTag = parsed.isFixed ? EVENT_TYPES.GROUPED : EVENT_TYPES.MONTHLY;
 
     const key = parsed.isFixed
       ? `${calendarId}::${parsed.cleanTitle}::FIXED`
@@ -3470,7 +3758,13 @@ function getExistingRegistryState(registrySheet) {
 
     const d = coerceDate(row[map['Event_Date']]);
     const month = d ? getMonthLabel(d) : '';
-    const key = typeTag === 'Fixed' ? `${source}::${title}::FIXED` : `${source}::${title}::${month}`;
+    // The ::FIXED group-key suffix is deliberately NOT renamed alongside the
+    // Type_Tag vocabulary: it's an internal key already persisted in the
+    // form registry (Script Properties) and matched against buildEventGroups()'
+    // output. Renaming it would orphan every stored entry and duplicate every
+    // grouped form. isGroupedTypeTag() reads both spellings of the VALUE,
+    // which is the part users see.
+    const key = isGroupedTypeTag(typeTag) ? `${source}::${title}::FIXED` : `${source}::${title}::${month}`;
     if (!state.groupFormMap[key]) state.groupFormMap[key] = formId;
   });
 
@@ -3524,15 +3818,26 @@ const BOOTSTRAP_RESUME_HANDLER = 'resumeBootstrapCalendars';
 const BOOTSTRAP_STATE_PROP_KEY = 'BOOTSTRAP_STATE_V1';
 
 /**
- * How long one slice may spend importing before it stops between groups.
- * Apps Script's ceiling is 6 minutes for consumer accounts; the gap is
- * headroom for the group in flight plus the wrap-up (flush, re-arm, log).
+ * How long one slice may spend importing before it stops between groups —
+ * targeting ~5-minute chunks so a big calendar takes fewer, longer runs
+ * instead of many short ones.
+ *
+ * NOT a flat 5 minutes on purpose. Apps Script's hard ceiling is 6 minutes,
+ * the budget is only checked BETWEEN groups, and a group can take ~30-60s on
+ * its own (a Drive copy, a dozen-plus Forms calls, a description write per
+ * event). At a 5.0-minute budget a group starting at 4:59 runs past the
+ * ceiling and gets killed mid-write; 4.5 leaves that group room to finish and
+ * still leaves time for the wrap-up (flush, re-arm, log, toast). The killed
+ * case is survivable — that's what the watchdog is for — but it costs a whole
+ * extra slice, so it's worth not inviting.
  */
-const BOOTSTRAP_SLICE_BUDGET_MS = 3.5 * 60 * 1000;
-/** Gap before the next slice after a clean hand-off. */
-const BOOTSTRAP_RESUME_DELAY_MS = 60 * 1000;
+const BOOTSTRAP_SLICE_BUDGET_MS = 4.5 * 60 * 1000;
+/** Gap before the next slice after a clean hand-off. Short, so the import doesn't idle between chunks. */
+const BOOTSTRAP_RESUME_DELAY_MS = 30 * 1000;
 /** Watchdog: armed before a slice starts, so a slice killed by the timeout still gets a successor. */
 const BOOTSTRAP_WATCHDOG_DELAY_MS = BOOTSTRAP_SLICE_BUDGET_MS + 2.5 * 60 * 1000;
+/** Toast progress roughly every this many groups WITHIN a slice, so a long chunk isn't silent. */
+const BOOTSTRAP_TOAST_EVERY_GROUPS = 5;
 /** Hard stop, so a bug can never leave the project trading triggers forever. */
 const BOOTSTRAP_MAX_SLICES = 30;
 /** Consecutive slices allowed to make no progress before giving up. */
@@ -3662,7 +3967,21 @@ function runBootstrapSlice() {
       renderProgramDashboard();
     }
 
-    const summary = importCalendarGroups(registrySheet, { deadline: Date.now() + BOOTSTRAP_SLICE_BUDGET_MS });
+    const doneBefore = state.groupsProcessed;
+    toastIfPossible(`Import chunk ${state.slices} running… (${doneBefore} program group(s) done so far)`);
+
+    const summary = importCalendarGroups(registrySheet, {
+      deadline: Date.now() + BOOTSTRAP_SLICE_BUDGET_MS,
+      // A 4.5-minute chunk is a long time to stare at an unchanged screen, so
+      // it reports in as it goes rather than only at the hand-off.
+      onGroupDone: partial => {
+        if (partial.groupsProcessed % BOOTSTRAP_TOAST_EVERY_GROUPS !== 0) return;
+        const done = doneBefore + partial.groupsProcessed;
+        const left = partial.groupsTotal - partial.groupsProcessed;
+        toastIfPossible(`Importing… ${done} program group(s), ${partial.eventsAdded} date(s) so far` +
+          (left > 0 ? ` — about ${left} left` : ''));
+      }
+    });
     state.groupsProcessed += summary.groupsProcessed;
     state.eventsAdded += summary.eventsAdded;
     state.formsCreated += summary.formsCreated;
@@ -3674,6 +3993,9 @@ function runBootstrapSlice() {
       finishBootstrap(state, null);
       return;
     }
+
+    toastIfPossible(`Import chunk ${state.slices} done — ${state.groupsProcessed} program group(s) imported, ` +
+      `${summary.remaining} to go. Next chunk starts in ${Math.round(BOOTSTRAP_RESUME_DELAY_MS / 1000)}s.`);
 
     // Still work to do. Guard against a group that can never succeed keeping
     // this going forever: no forward movement twice running ends it.
@@ -3935,18 +4257,14 @@ function refreshFormForNewDates(formId, group, locationName, configInfo) {
   };
 }
 
-/**
- * Creates a new per-group registration form by COPYING the appropriate
- * template — the Fixed-series template (with its Attendance Mode / All-
- * Dates-Lunch pages) for Fixed groups, the regular template otherwise.
- */
+/** Creates a new per-group registration form by COPYING the one shared template. */
 function createRegistrationForm(group, locationName, configInfo) {
   const formTitle = group.isFixed
     ? `${group.cleanTitle} — Registration`
     : `${group.cleanTitle} - ${group.monthLabel}`;
 
   // One template for everything now — the Attendance Mode fast path is on
-  // every form, so Fixed and Regular groups no longer need separate bases.
+  // every form, so Grouped and Monthly groups no longer need separate bases.
   const templateForm = getOrCreateTemplateForm();
   const copiedFile = DriveApp.getFileById(templateForm.getId()).makeCopy(formTitle, getOrCreateFormsFolder());
   const form = FormApp.openById(copiedFile.getId());
@@ -4243,7 +4561,7 @@ function syncRegistrations() {
   // hadn't been imported yet would lose its answers with them.
   migrateFormsToCurrentTemplate(registrySheet, sessionRows);
 
-  // Catch up "sign up for all dates" registrants on Fixed-series forms
+  // Catch up "sign up for all dates" registrants on Grouped-series forms
   // whose date list has grown since they originally registered.
   applyAllDatesCatchup(registryIndex, protectedKeys, existingRowIndex, orderAheadDays, newRows);
 
@@ -4514,7 +4832,7 @@ function processFormResponse(formIndex, response, registryIndex, protectedKeys, 
 }
 
 /**
- * Handles a Fixed-series form submitted via "Sign up for all dates": one
+ * Handles a Grouped-series form submitted via "Sign up for all dates": one
  * lunch choice per person is applied to EVERY current session date on the
  * form (matchingEntries), and each person is recorded in the persistent
  * ALL_DATES registry so future syncRegistrations() runs can retroactively
@@ -4560,7 +4878,7 @@ function processAllDatesResponse(args) {
  * on file, checks whether any of the form's CURRENT session dates are
  * missing a row for that person, and fills them in — this is what makes
  * "all dates" keep meaning "every date," including ones added to an
- * ongoing Fixed series after the original registration.
+ * ongoing Grouped series after the original registration.
  */
 function applyAllDatesCatchup(registryIndex, protectedKeys, existingRowIndex, orderAheadDays, newRows) {
   const registry = getAllDatesRegistry();
@@ -4781,7 +5099,7 @@ function recomputeCountsForZone(registrySheet, dataStart, numRows, regMap, count
  * is what turns silent waitlisting into a signal a respondent can actually
  * see before they submit. Forms with no capped sessions at all are skipped
  * entirely (nothing on them can ever go full), so this stays cheap on the
- * common case of unlimited/"Regular" programs.
+ * common case of unlimited/"Monthly" programs.
  */
 function refreshFormCapacityLabelsForAllForms(registrySheet) {
   const headers = HEADERS.Master_Program_Dashboard;
@@ -4970,7 +5288,7 @@ function migrateFormsToCurrentTemplate(registrySheet, sessionRows) {
       rebuildFormFromCurrentTemplate(form, {
         location,
         dates,
-        isFixed: formRows.some(r => r[map['Type_Tag']] === 'Fixed'),
+        isFixed: formRows.some(r => isGroupedTypeTag(r[map['Type_Tag']])),
         capacityHints: buildCapacityHintsFromRegistryRows(formRows, map)
       });
     } catch (err) {
