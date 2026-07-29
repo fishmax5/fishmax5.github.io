@@ -75,16 +75,32 @@ calendar, so no settings go there.
 |---|---|
 | *(nothing)* | A program with **no capacity limit**, grouped by month |
 | `[Cap: 12]` | Capped at **12 people**; #13 is waitlisted automatically |
-| `[Fixed]` | One continuous series — **one form** for the whole run |
-| `[Cap: 12, Fixed]` | Both. `[Cap: 12] [Fixed]` on separate lines works too. |
+| `[Grouped]` | One continuous series — **one form** for the whole run |
+| `[Monthly]` | A **separate form per calendar month** (the default) |
+| `[Cap: 12, Grouped]` | Both. `[Cap: 12] [Grouped]` on separate lines works too. |
 
 You can write anything else you like in the description around them — only
-brackets containing `Cap:` or `Fixed` are read.
+brackets containing `Cap:`, `Grouped` or `Monthly` are read.
 
-**About `[Fixed]`:** use it for something like a 6-week course, where one
-registration should cover the whole run. Without it, sessions are grouped **by
-month**, so a program running all year gets a separate form for January,
-February, and so on — which is what you want for a drop-in weekly thing.
+**Grouped vs Monthly** — this is just "how many forms?":
+
+- **Grouped** — one form for the whole run. Use it for something like a 6-week
+  course, where one registration should cover every session.
+- **Monthly** — a new form each calendar month. Right for a drop-in weekly
+  thing, so January's sign-ups don't pile up with December's. This is what you
+  get if you say nothing.
+
+> **These used to be called `Fixed` and `Regular`.** Both old words still work
+> everywhere — in descriptions and in the `Type_Tag` column — so there is
+> nothing to go back and change. "Fixed" wasn't fixed in any sense you'd guess,
+> and "Regular" described both cases equally badly.
+
+**You can also change it from the spreadsheet.** Edit the `Type_Tag` column on
+**Master_Program_Dashboard** (it's yellow, because it's yours to change). You'll
+be asked to confirm, because switching re-partitions that program across forms —
+and if you say yes, the system writes the tag into **every** calendar event for
+that program, so the change sticks and all its months end up on the same footing.
+Say no and the cell goes straight back to what it was.
 
 > Older events with `[Cap: 12]` or `Fixed` in the **title** still work — the
 > system reads them and logs a reminder to move them. New events should put
@@ -130,8 +146,15 @@ The **Status** column is computed for you:
 | 🔴 Waitlist Only | Full — new sign-ups are waitlisted |
 
 **This whole tab is rebuilt from the calendar on every sync.** Don't hand-edit
-it; your changes will be overwritten. If a session is wrong here, fix the
-calendar event.
+it; your changes will be overwritten (you'll get a warning if you try). If a
+session is wrong here, fix the calendar event.
+
+**The one exception is `Type_Tag`** — it's yellow because it *is* yours to
+change, and changing it writes back to the calendar so it sticks. See
+[Grouped vs Monthly](#setting-up-your-calendar-events) above.
+
+`Form_ID`, `Event_ID`, `Calendar_Source` and `Calendar_Synced?` are **hidden** —
+internal plumbing. The "View Live Form" link you actually hand out stays visible.
 
 ### 2. Master_Lunch_Dashboard
 What to order. **Today's Lunch Needs** sits at the top and always stays visible.
@@ -143,44 +166,91 @@ anyone signs up. What counts as "on the table" is set per location in Config
 under **Lunch Service by Location** — that's what keeps Zoom (which never serves
 lunch) from adding a blank row for every session it runs.
 
+The columns you read first are at the **front**:
+
+| Column | What it means |
+|---|---|
+| `Registered_Count` | What the **forms** say — how many asked for lunch |
+| `Served_Confirmed` | What **actually happened** — how many `Lunch_Served` boxes you ticked on the Registrants tab |
+| `Total_to_Order` | Live formula: `Registered_Count + Standard_Buffer + Tester_Buffer` |
+
+`Served_Confirmed` stays **blank** until you've ticked something — a real `0`
+("nobody came") and "not counted yet" mean very different things, so it won't
+claim the first. It counts every tick, including walk-ins who never registered.
+
 Columns with a **✍️ pencil and a yellow header are yours to fill in** — the
-system never overwrites them:
+system never overwrites them. They now sit at the **end** of the row, because
+they're reconciliation detail and were pushing the numbers you actually order
+against off the screen:
 
 `Standard_Buffer` · `Tester_Buffer` · `Actual_Ordered` · `Day_1_In-Person` ·
 `Day_1_Takeaway` · `Subs_In-Person` · `Subs_Takeaway` · `Total_Consumed` ·
 `Thrown_Away` · `Discrepancy`
 
-**Total_to_Order** is a live formula: `Registered_Count + Standard_Buffer +
-Tester_Buffer`.
-
 Because there's one row per date **per location**, each row is **shaded by
 location** — Narberth light orange, Ashbridge light green, Zoom lavender — so a
 week with several sites reads as blocks of color. The `Event_Date` cell keeps
-its month tint and the ✍️ columns keep their yellow, and a row you've marked
-`Manually Edited`/`Manually Added` still goes purple on top of everything.
+its month tint and the ✍️ columns keep their yellow.
 
 ### 3. Lunch_and_Event_Registrants
 One row **per person, per session** — guests get their own rows, not a note on
-someone else's. `Event_Date` leads the row (as on every date-based tab), with
-`Location` and `Event` right behind it, so you never have to scroll to see which
-program a registrant belongs to.
+someone else's.
+
+#### ⚡ Quick Mark — the fast way to mark people off
+
+The panel at the **top of this tab** is how you tick people in on the day,
+without hunting for their row:
+
+1. **Location** — pick from the dropdown.
+2. **Program** — the list narrows to programs at that location.
+3. **Name** — narrows again to people registered for it.
+4. Tick **✓ Attended** or **✓ Lunch**.
+
+That's it. The system finds that person's row wherever it is, ticks it, tells
+you what it did on the line underneath, and clears itself for the next person.
+The **Clear** box resets it if you pick wrong.
+
+- **Ticking Lunch also ticks Attended** — you can't be fed without being there.
+- If someone's registered for **several dates** of the same program, it marks
+  the nearest one (today first, then the next upcoming) and says so, e.g.
+  *"Marked attendance for Marion Webb — Tue, Aug 5 (2 sessions matched — marked
+  the nearest)."* If that's the wrong one, tick the right row directly.
+- If nothing matches, it says so and **changes nothing** — no silent guesses.
+
+You can always tick `Attended` / `Lunch_Served` **directly on a row** instead;
+the panel is just faster when you're standing at a sign-in desk.
+
+#### The columns
+
+`Event_Date`, `Location` and `Event` lead the row, then **`Name`, `Attended`,
+`Lunch_Served`** — so who-they-are and did-they-come sit together with no
+scrolling.
 
 | Column | What it tells you |
 |---|---|
 | `Event_Date` | The session day — first column, tinted by month |
 | `Location` / `Event` | Which program and location this row belongs to |
+| ✍️ `Attended` | **Yours to tick.** They turned up |
+| ✍️ `Lunch_Served` | **Yours to tick.** They were actually fed — this is what `Served_Confirmed` on the lunch dashboard counts |
 | `Person_Type` | `Attendee` (registered themselves) or `Guest` |
-| `Lunch_Type` | `Hot`, `Cold`, or `No Lunch` — the actual dish category, not just yes/no |
+| ✍️ `Lunch_Type` | `Hot`, `Cold`, or `No Lunch` — the actual dish category, not just yes/no |
+| ✍️ `Lunch_Status` | Needed · No Lunch · Waitlisted · Cancelled · Superseded |
+| ✍️ `Program_Status` | Active · Waitlisted · Cancelled · Superseded |
 | `Primary_Registrant` | `Self`, or the name of whoever brought them |
 | `Party_Size` | Headcount on that submission — "party of 3, one no-show" |
-| `Form_Source` | Link to **that person's actual submission** |
-| `Program_Status` | Active · Waitlisted · Cancelled · Superseded |
-| `Lunch_Status` | Needed · No Lunch · Waitlisted · Cancelled · Superseded |
 | `Order_Ahead_Flag` | Highlighted when someone registered too late to order for |
-| `Admin_Notes` | Allergies/dietary needs, plus anything they typed |
-| `Party_ID` | Groups everyone from one submission together (last column — an internal ID, not something you usually need to read) |
+| ✍️ `Admin_Notes` | Allergies/dietary needs, plus anything they typed |
+| `Manual_Override` | Turns purple when a row has been hand-edited, so the sync leaves it alone |
 
-Only rows that are **`Active` *and* `Needed`** count toward the catering numbers.
+**✍️ and yellow means yours to fill in** — the same convention as every other
+tab. Everything without it came from a form or is worked out automatically, and
+will be overwritten if you type in it (you'll get a warning if you try).
+
+`Event_ID`, `Party_ID` and `Form_Source` are **hidden** — internal plumbing.
+Unhide them from Google Sheets' column menu if you're troubleshooting.
+
+Only rows that are **`Active` *and* `Needed`** count toward the catering numbers
+that get *ordered*. `Served_Confirmed` is separate — see below.
 
 > `Lunch_Type` is resolved from **Lunch_Schedule** at the moment the row is
 > created and doesn't change afterward — the same "fact about when it
@@ -208,9 +278,42 @@ form and labels it "No Lunch Served," so nobody is asked to pick a meal that
 doesn't exist. If that leaves the form with **no** catered dates at all, the
 lunch questions come off the form entirely and its description says lunch isn't
 provided — and they come back on their own if you later add a catered date.
-Editing this tab immediately pushes both changes to the affected forms.
 
-### 5. Config
+**When you edit a menu row, you'll be asked whether to update the forms.** Say
+**yes** to push the new label out to every registration form covering that date;
+say **no** to just save it here and let the next Sync Cal apply it. Useful when
+you're part-way through typing a week's menu and don't want each keystroke
+rewriting live forms.
+
+### 5. Member_Roll and Program_Options — your own notes
+
+These two tabs are the only ones holding knowledge the system can't work out for
+itself. Each is split down the middle:
+
+- **The left columns are recomputed** every sync. Don't hand-edit them; they'll
+  be overwritten.
+- **The ✍️ yellow columns on the right are yours, permanently.** Nothing ever
+  overwrites them.
+
+**Member_Roll** — one row per person who has ever registered:
+
+| Recomputed | Yours |
+|---|---|
+| `Times_Seen`, `First_Seen`, `Last_Seen`, `Locations`, `Usual_Lunch` | `Usual_Guests`, `Dietary_Notes`, `Contact`, `Staff_Notes` |
+
+This is where "Marion always brings her sister" or "cold lunch only, no dairy"
+lives. People stay on the roll even after their sessions age out, so the notes
+don't evaporate.
+
+**Program_Options** — one row per program per location:
+
+| Recomputed | Yours |
+|---|---|
+| `Type_Tag`, `Sessions_Tracked`, `Next_Date`, `Last_Date` | `Typical_Attendance`, `Usual_Capacity`, `Room_Or_Setup`, `Staff_Notes` |
+
+"Needs the big room." "Usually 8 even though it's capped at 12."
+
+### 6. Config
 Four small settings blocks:
 
 - **🍱 Meal Buffer Amounts** — extra meals per Location × Hot/Cold, used to
@@ -242,7 +345,7 @@ something needs a person: waitlisted registrants, forms that couldn't be opened,
 and events sent to triage. A quiet sync sends nothing. **Leave it blank to turn
 notifications off.**
 
-### 6. Deleted_Event_Triage
+### 7. Deleted_Event_Triage
 Safety net. If a calendar event disappears but people had registered for it,
 their rows are moved here instead of being deleted, with a note. Follow up with
 those people, then clear the rows.
@@ -349,6 +452,29 @@ Press a menu item when you want something *now* instead of waiting.
 
 ---
 
+## When it asks "are you sure?"
+
+Most of this workbook only affects the workbook. A few things reach **outside**
+it — into live Google Forms people are registering on, or into your calendar
+events. Those always ask first, in plain language, and do nothing at all if you
+say no:
+
+| You do this | It asks because |
+|---|---|
+| Press **Sync Cal** | It can create forms, change form dates, and edit calendar descriptions |
+| Change `Type_Tag` on the program dashboard | It re-partitions that program across forms, and writes the tag onto every one of its calendar events |
+| Edit a **Lunch_Schedule** menu row | It rewrites the date labels on live forms, and can add/remove the lunch question |
+| Change **Lunch Service by Location** in Config | It decides whether that location's forms ask about lunch at all |
+
+For a cell edit, saying **no puts the old value straight back** — the cell
+reverts, nothing is left half-changed.
+
+The **scheduled** runs (daily Sync Cal, hourly Sync Registrations) don't ask —
+there's nobody at the keyboard to answer, and doing their job on schedule is the
+point. Only a person clicking gets the question.
+
+---
+
 ## Admin-only actions
 
 A handful of actions restructure the workbook or the project's automation
@@ -401,15 +527,32 @@ Edit `[Cap: N]` in the event description. New sign-ups respect the new number on
 the next sync; already-recorded rows keep the status they were given.
 
 **Change what's for lunch**
-Edit **Lunch_Schedule**. Forms update themselves.
+Edit **Lunch_Schedule**. You'll be asked whether to push it to the forms now or
+let the next sync do it.
+
+**Mark people in on the day**
+Use the **⚡ Quick Mark** panel at the top of
+**Lunch_and_Event_Registrants** — location, program, name, then tick Attended or
+Lunch. See [that tab's section](#3-lunch_and_event_registrants).
+
+**Check how many lunches actually went out**
+Compare `Registered_Count` (what the forms said) with `Served_Confirmed` (what
+you ticked) on **Master_Lunch_Dashboard**.
+
+**Note that someone always brings a guest**
+Put it in `Usual_Guests` on **Member_Roll**. It stays there forever — nothing
+overwrites your columns on that tab.
 
 **Cancel one person's registration**
 On **Lunch_and_Event_Registrants**, set their `Program_Status` to `Cancelled`.
-The row turns purple (`Manually Edited`) and is protected from being overwritten.
+The `Manual_Override` cell turns purple and the row is protected from being
+overwritten.
 
 **Add a walk-in who never filled out the form**
 Add a row on **Lunch_and_Event_Registrants** and set `Manual_Override` to
-`Manually Added`. It'll be counted and never overwritten.
+`Manually Added`. It'll be counted and never overwritten. (Or just tick
+`Lunch_Served` on any row — walk-in meals count toward `Served_Confirmed`
+regardless of what the form said.)
 
 **Move someone off the waitlist**
 Change `Program_Status` from `Waitlisted` to `Active`. You'll get a reminder

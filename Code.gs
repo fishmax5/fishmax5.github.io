@@ -2103,9 +2103,33 @@ function handleLunchScheduleEdit(e, sheet) {
     .map(r => ({ date: coerceDate(r[map['Event_Date']]), location: r[map['Location']] }))
     .filter(p => p.date);
 
+  // Re-sorting the tab is harmless and always safe to do.
   renderLunchScheduleSheet();
 
+  if (dateLocationPairs.length === 0) return;
+
+  // Pushing the menu out to forms is NOT harmless: it rewrites the visible
+  // date labels on live registration forms, and can add or remove the lunch
+  // question entirely (see syncLunchQuestionsOnForm). Someone mid-way through
+  // typing a menu doesn't necessarily want that yet.
+  const dateList = dateLocationPairs
+    .map(p => `${formatDateLabel(p.date)}${p.location ? ` (${p.location})` : ''}`)
+    .slice(0, 5)
+    .join('\n• ');
+  const more = dateLocationPairs.length > 5 ? `\n• …and ${dateLocationPairs.length - 5} more` : '';
+  const proceed = confirmConsequentialAction('Update the registration forms?',
+    `The menu changed for:\n• ${dateList}${more}\n\n` +
+    'Every registration form covering these dates will have its date labels rewritten, and the lunch ' +
+    'question added or removed to match.\n\nSay No to save the menu here without touching the forms — ' +
+    'the next Sync Cal will pick it up.', false);
+
+  if (!proceed) {
+    toastIfPossible('Menu saved. Forms were NOT changed — the next Sync Cal will apply it.');
+    return;
+  }
+
   dateLocationPairs.forEach(p => refreshFormsForChangedLunchDate(p.date, p.location));
+  toastIfPossible(`Menu saved and pushed to the forms for ${dateLocationPairs.length} date(s).`);
 }
 
 /**
@@ -3652,12 +3676,27 @@ function syncCalendars() {
     log(`syncCalendars: a large-setup import (${BOOTSTRAP_ENTRY_NAME}()) is in progress — skipping this run so the two don't fight over the same forms.`);
     return;
   }
+
+  // Asked only when a human is driving. A calendar sync can create forms,
+  // rewrite the date list on existing ones, and edit event descriptions —
+  // outward-facing changes people see. The scheduled daily run passes this
+  // (defaultWhenUnattended: true) because that is precisely its job; a menu
+  // click gets to say no.
+  if (!confirmConsequentialAction('Sync calendars now?',
+    'This reads every program calendar and may CREATE registration forms, update the dates on ' +
+    'existing forms, and edit the registration link in calendar event descriptions.\n\n' +
+    'Registrants and their answers are never changed.', true)) {
+    return;
+  }
+
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(SYNC_LOCK_WAIT_MS)) {
     log('syncCalendars: another sync is already running — skipping this run.');
+    toastIfPossible('Another sync is already running — try again in a moment.');
     return;
   }
   try {
+    toastIfPossible('Syncing calendars…');
     syncCalendarsInternal();
   } finally {
     lock.releaseLock();
