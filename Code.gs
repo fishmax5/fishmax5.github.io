@@ -2723,6 +2723,21 @@ function saveCalendarSyncToken(calendarId, token) {
  * Fired by the calendar-edit triggers installed in writeCalendarChangeTriggers().
  */
 function onCalendarChange(e) {
+  // FIRST LINE, before anything else costs a call: a bootstrap import deletes
+  // these triggers, but a firing can still arrive afterwards — Google's
+  // notification channel for a calendar is torn down asynchronously, and the
+  // import is generating hundreds of changes for it to deliver. Deletion
+  // stops NEW subscriptions; it does not recall what is already in flight.
+  //
+  // So the handler treats being called during an import as normal and makes
+  // it free: one log line, no delta call, no lock, no sheet read. If these
+  // keep appearing long after an import ends, the triggers are being
+  // re-created rather than drained — logProjectTriggers() tells you which.
+  if (isBootstrapActive()) {
+    log('onCalendarChange ignored — a large-setup import is running and is editing these events itself.');
+    return;
+  }
+
   const calendarId = e && e.calendarId;
   if (!calendarId) {
     log('onCalendarChange fired with no calendarId on the event object — falling back to a full syncCalendars().');
@@ -3619,6 +3634,37 @@ function pauseAutomationForBootstrap() {
 function armBootstrapResume(delayMs) {
   deleteBootstrapResumeTriggers();
   ScriptApp.newTrigger(BOOTSTRAP_RESUME_HANDLER).timeBased().after(delayMs).create();
+}
+
+/**
+ * DIAGNOSTIC — run from the Apps Script editor. Logs every trigger this
+ * project currently has, plus whether an import is in flight.
+ *
+ * Use it when onCalendarChange executions keep appearing during an import.
+ * There are only two explanations and this separates them:
+ *
+ *   - NO onCalendarChange trigger listed, yet executions keep arriving:
+ *     Google is draining notifications it had already accepted for a channel
+ *     that is being torn down. Nothing in this script can recall those. They
+ *     cost one log line each (see onCalendarChange) and stop on their own.
+ *   - onCalendarChange triggers ARE listed while an import is active:
+ *     something re-created them. That is a bug worth chasing — check whether
+ *     initSheet() or another project (a second copy of this script bound to
+ *     the same calendars) is running.
+ */
+function logProjectTriggers() {
+  const triggers = ScriptApp.getProjectTriggers();
+  const active = isBootstrapActive();
+  log(`Project triggers (${triggers.length}) — large-setup import ${active ? 'IS' : 'is NOT'} currently active:`);
+  triggers.forEach(t => {
+    const source = t.getTriggerSourceId();
+    log(`  • ${t.getHandlerFunction()}${source ? ` [${CALENDAR_MAP[source] || source}]` : ''}`);
+  });
+  if (active && triggers.some(t => t.getHandlerFunction() === 'onCalendarChange')) {
+    log('⚠️ A calendar-edit trigger exists DURING an import — it should have been paused. ' +
+      'Something re-created it; the next slice will remove it again.');
+  }
+  return triggers.length;
 }
 
 function deleteBootstrapResumeTriggers() {
