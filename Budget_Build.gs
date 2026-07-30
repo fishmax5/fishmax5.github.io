@@ -365,7 +365,7 @@ function applyConditionalFormats(sheet, spec, lastRow) {
       // A manual override is a fact worth seeing at a glance.
       rules.push(SpreadsheetApp.newConditionalFormatRule()
         .whenFormulaSatisfied(`=$G${DATA_START_ROW}<>""`)
-        .setBackground('#FFF2CC').setFontWeight('bold')
+        .setBackground('#FFF2CC').setBold(true)
         .setRanges([colRange('override'), colRange('budgeted')]).build());
       // Kind tinting makes the long-format grid scannable.
       Object.keys(CATEGORY_KIND_COLORS).forEach(kind => {
@@ -464,7 +464,7 @@ function applyConditionalFormats(sheet, spec, lastRow) {
 
     case SHEET_NAMES.DEBTS: {
       rules.push(SpreadsheetApp.newConditionalFormatRule()
-        .whenNumberEqualTo(1).setBackground(GOOD_BG).setFontWeight('bold')
+        .whenNumberEqualTo(1).setBackground(GOOD_BG).setBold(true)
         .setRanges([colRange('rank')]).build());
       // "never" — the payment does not cover the interest.
       rules.push(SpreadsheetApp.newConditionalFormatRule()
@@ -614,6 +614,14 @@ function buildDashboardSheet(ss) {
   sheet.clear();
   sheet.clearConditionalFormatRules();
   sheet.getCharts().forEach(c => sheet.removeChart(c));
+
+  // sheet.clear() does NOT break merges, and the KPI tiles are merged cells.
+  // If the layout ever shifts between versions — as it did when the zero-based
+  // check was added — a stale merge from the old layout can straddle a cell the
+  // new layout wants to merge, and Sheets throws rather than resolving it.
+  // Breaking every merge first makes a repair run layout-version independent.
+  sheet.getRange(1, 1, Math.max(sheet.getMaxRows(), 90), Math.max(sheet.getMaxColumns(), DASH_COLS))
+    .breakApart();
 
   if (sheet.getMaxColumns() < DASH_COLS) {
     sheet.insertColumnsAfter(sheet.getMaxColumns(), DASH_COLS - sheet.getMaxColumns());
