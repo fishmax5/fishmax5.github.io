@@ -2321,13 +2321,24 @@ const ROW_HEIGHTS = {
 };
 
 /**
- * Writes a merged section banner at an arbitrary row.
+ * Writes a section banner at an arbitrary row: text in column A, the banner
+ * color across the full width of the table.
  *
- * LEFT-ALIGNED, deliberately: a banner is merged across the full width of the
- * table, so centering puts its text in the middle of a very wide strip —
- * nowhere near the column-A edge the eye scans down. Left-aligned, every
- * banner starts on the same vertical line as the data beneath it and the tab
- * reads as a stack of labelled blocks.
+ * LEFT-ALIGNED, deliberately: centering put the text in the middle of a very
+ * wide strip, nowhere near the column-A edge the eye scans down. Left-aligned,
+ * every banner starts on the same vertical line as the data beneath it and the
+ * tab reads as a stack of labelled blocks.
+ *
+ * NOT MERGED, and that matters. It used to merge across the table, which is
+ * incompatible with freezing columns — Sheets refuses with "you can't freeze
+ * columns which contain only part of a merged cell", and since every tab has
+ * these banners, one merged banner blocked setFrozenColumns() on the whole tab
+ * (this took out initSheet() entirely). Once the text is left-aligned the merge
+ * buys nothing: OVERFLOW lets it spill across the empty cells to its right and
+ * it looks identical.
+ *
+ * breakApart() is still called, on the full row width, to undo merges left
+ * behind by earlier versions of this function.
  *
  * `hero` gives the one banner per tab that should dominate (Today's Lunch
  * Needs, Today at Each Location) a larger size, deeper blue and a taller row.
@@ -2335,20 +2346,47 @@ const ROW_HEIGHTS = {
 function writeSectionBanner(sheet, row, numCols, text, options) {
   options = options || {};
   const style = options.hero ? TYPO.BANNER_HERO : TYPO.BANNER;
-  const range = sheet.getRange(row, 1, 1, numCols);
-  try { range.breakApart(); } catch (err) { /* not previously merged */ }
-  range.merge()
-    .setValue(text)
+
+  // Full row width, not just numCols: an older render may have merged wider.
+  try {
+    sheet.getRange(row, 1, 1, Math.max(sheet.getMaxColumns(), numCols)).breakApart();
+  } catch (err) { /* nothing merged here */ }
+
+  sheet.getRange(row, 1, 1, numCols)
     .setFontSize(style.size)
     .setFontWeight(style.weight)
     .setFontColor(style.color)
     .setBackground(style.background)
+    .setVerticalAlignment('middle');
+
+  sheet.getRange(row, 1)
+    .setValue(text)
     .setHorizontalAlignment('left')
-    .setVerticalAlignment('middle')
-    .setWrapStrategy(SpreadsheetApp.WrapStrategy.CLIP);
+    .setWrapStrategy(SpreadsheetApp.WrapStrategy.OVERFLOW);
+
   try {
     sheet.setRowHeight(row, options.hero ? ROW_HEIGHTS.BANNER_HERO : ROW_HEIGHTS.BANNER);
   } catch (err) { /* row may not exist yet on a brand-new sheet */ }
+}
+
+/**
+ * Freezes `count` columns, tolerating failure.
+ *
+ * Sheets refuses to freeze columns that would cut a merged cell in half, and a
+ * merge can arrive from anywhere — an old render, or someone merging a few
+ * cells by hand. A frozen column is a nicety; losing the entire render over one
+ * is not a trade worth making, so this reports and carries on.
+ */
+function freezeColumnsSafely(sheet, count) {
+  if (!count || count < 1) return false;
+  try {
+    sheet.setFrozenColumns(count);
+    return true;
+  } catch (err) {
+    log(`ℹ️ Could not freeze ${count} column(s) on "${sheet.getName()}" (${err}) — ` +
+      `usually a merged cell spanning the freeze line. Everything else rendered normally.`);
+    return false;
+  }
 }
 
 /** Writes a bold, dark header row of the given headers at an arbitrary row. */
@@ -2490,22 +2528,29 @@ function buildConfigSheet(ss) {
 function writeConfigStructure(sheet) {
   Object.values(CONFIG_LAYOUT).forEach(section => {
     const span = section.headers.length;
+    // Config's banners DO stay merged: unlike every other tab's, these sit
+    // side by side across the row (one per settings block, each spanning only
+    // its own columns), so the merge is what visually bounds each block — and
+    // Config never freezes columns, so there is nothing for it to conflict
+    // with. Left-aligned and on the shared scale, to match the other tabs.
     const bannerRange = sheet.getRange(1, section.startCol, 1, span);
     try { bannerRange.breakApart(); } catch (err) { /* not previously merged */ }
     bannerRange.merge()
       .setValue(section.title)
-      .setFontWeight('bold')
-      .setFontColor('#FFFFFF')
-      .setBackground('#6D9EEB')
-      .setHorizontalAlignment('center')
+      .setFontSize(TYPO.BANNER.size)
+      .setFontWeight(TYPO.BANNER.weight)
+      .setFontColor(TYPO.BANNER.color)
+      .setBackground(TYPO.BANNER.background)
+      .setHorizontalAlignment('left')
       .setVerticalAlignment('middle')
       .setWrapStrategy(SpreadsheetApp.WrapStrategy.CLIP);
 
     sheet.getRange(CONFIG_HEADER_ROW, section.startCol, 1, span)
       .setValues([section.headers])
-      .setFontWeight('bold')
-      .setBackground('#434343')
-      .setFontColor('#FFFFFF');
+      .setFontSize(TYPO.COLUMN_HEADER.size)
+      .setFontWeight(TYPO.COLUMN_HEADER.weight)
+      .setBackground(TYPO.COLUMN_HEADER.background)
+      .setFontColor(TYPO.COLUMN_HEADER.color);
   });
   sheet.setFrozenRows(CONFIG_HEADER_ROW);
 }
@@ -5967,19 +6012,25 @@ function writeQuickMarkPanel(sheet, headers, rows) {
   setQuickMarkStatus(sheet, numCols, 'Ready — choose a location to begin.');
 }
 
-/** The one-line feedback cell under the panel's inputs. */
+/**
+ * The one-line feedback cell under the panel's inputs. Unmerged and
+ * overflowing, for the same reason as writeSectionBanner(): a merge here would
+ * block setFrozenColumns() on this tab.
+ */
 function setQuickMarkStatus(sheet, numCols, message) {
   const width = Math.max(numCols || QUICK_MARK_LABELS.length, QUICK_MARK_LABELS.length);
-  const range = sheet.getRange(QUICK_MARK.statusRow, 1, 1, width);
-  try { range.breakApart(); } catch (err) { /* not merged */ }
-  range.merge()
+  try {
+    sheet.getRange(QUICK_MARK.statusRow, 1, 1, Math.max(sheet.getMaxColumns(), width)).breakApart();
+  } catch (err) { /* nothing merged here */ }
+
+  sheet.getRange(QUICK_MARK.statusRow, 1, 1, width).setBackground('#FFFFFF');
+  sheet.getRange(QUICK_MARK.statusRow, 1)
     .setValue(message)
     .setFontSize(TYPO.MUTED.size + 1)
     .setFontColor('#0B5394')
     .setFontWeight('bold')
-    .setBackground('#FFFFFF')
     .setHorizontalAlignment('left')
-    .setWrapStrategy(SpreadsheetApp.WrapStrategy.CLIP);
+    .setWrapStrategy(SpreadsheetApp.WrapStrategy.OVERFLOW);
 }
 
 /**
@@ -6245,7 +6296,7 @@ function applyRegistrantsFormatting(sheet, headers, result) {
   applyColumnVisibility(sheet, headers, REGISTRANT_HIDDEN_COLUMNS);
   // Name is the row's identity; keep it and the date on screen while scrolling
   // right through the form-supplied columns.
-  sheet.setFrozenColumns(Math.min(map['Name'] + 1, headers.length));
+  freezeColumnsSafely(sheet, Math.min(map['Name'] + 1, headers.length));
 
   // Warn (don't block) on the columns the sync owns — a correction typed into
   // Event_Date or Name doesn't move the registration, it just gets overwritten
@@ -6617,7 +6668,7 @@ function writeMemoryTab(sheet, headers, rows, options) {
   }
 
   sheet.setFrozenRows(MEMORY_TAB_HEADER_ROW);
-  sheet.setFrozenColumns(1); // the name/program is the row's identity — keep it visible
+  freezeColumnsSafely(sheet, 1); // the name/program is the row's identity — keep it visible
   autosizeColumns(sheet, { minCols: numCols, force: true });
 }
 
@@ -7424,7 +7475,7 @@ function writeProgramDashboardSheet(sheet, headers, map, sessionRows, todayData,
 
   // Freeze through the Today block only, so it stays visible while the rest scrolls.
   sheet.setFrozenRows(todayDataStart + todayRowsOut.length - 1);
-  sheet.setFrozenColumns(3); // date, location, program name
+  freezeColumnsSafely(sheet, 3); // date, location, program name
   autosizeColumns(sheet, { force: !!force, minCols: headers.length });
   log(`renderProgramDashboard complete: ${todayRowsOut.length} location(s) today, ${upcoming.length} upcoming / ${past.length} past session row(s).`);
 }
@@ -7813,7 +7864,7 @@ function writeMasterLunchDashboardSheet(sheet, plan, headers, fullTableRows, rol
   // Nothing on this tab is an internal key, so nothing is hidden — but the
   // call still runs, so a column taken OFF a future hidden list reappears.
   applyColumnVisibility(sheet, headers, LUNCH_DASHBOARD_HIDDEN_COLUMNS);
-  sheet.setFrozenColumns(2); // date + location stay visible across the wide reconciliation columns
+  freezeColumnsSafely(sheet, 2); // date + location stay visible across the wide reconciliation columns
 
   autosizeColumns(sheet, { minCols: numCols });
 }
