@@ -364,8 +364,12 @@ const SETUP_FIELDS = [
     note: 'First month the budget covers. Defaults to 12 months ago so you have history to average against.' },
 
   { section: 'Income' },
-  { name: 'CFG_INCOME', label: 'Planned monthly net income', value: 6000, format: CURRENCY_FORMAT,
+  { name: 'CFG_INCOME', label: 'Planned monthly net income', value: 3395, format: CURRENCY_FORMAT,
     note: 'TAKE-HOME pay, after tax and payroll deductions. Using gross income here inflates every downstream number and is the most common setup mistake.' },
+  { name: 'CFG_GROSS_SALARY', label: 'Gross annual salary', value: 48000, format: CURRENCY_FORMAT_WHOLE,
+    note: 'Used only by the salary-scenario table on Projections. Your actual budget always runs on the take-home figure above.' },
+  { name: 'CFG_TAKEHOME_RATE', label: 'Take-home rate (net ÷ gross)', value: 0.845, format: PCT_FORMAT,
+    note: 'What fraction of gross salary actually reaches your account after tax, FICA and payroll deductions. Derive it from a real payslip rather than guessing — 0.845 matches $48,000 gross against $3,395/month net.' },
   { name: 'CFG_INCOME_GROWTH', label: 'Annual income growth %', value: 0.03, format: PCT_FORMAT,
     note: 'Long-run raise rate. 3% roughly tracks inflation, i.e. flat real income — a deliberately unambitious default.' },
 

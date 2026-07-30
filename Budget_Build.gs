@@ -698,8 +698,30 @@ function buildDashboardSheet(ss) {
   dashTile(sheet, 9, 11, 'GOALS ON TRACK', goalsF, '@',
     `="on track / total"`);
 
+  // --- To Assign: the zero-based budget's single most important number ------
+  // Planned income minus everything assigned to a category. Zero is the goal:
+  // positive means dollars have no job yet, negative means the plan promises
+  // money that is not there. A plan can look reasonable line by line and still
+  // be over-committed in total — that total is only visible here.
+  dashSectionHeader(sheet, 12, '🧾 ZERO-BASED CHECK');
+  const assignedF =
+    `=IFERROR(SUMIFS('${B}'!$H:$H,'${B}'!$A:$A,${MK},'${B}'!$E:$E,"<>${CATEGORY_KINDS.INCOME}"),0)`;
+  sheet.getRange(12, 5)
+    .setFormula(`=IFERROR("Planned income "&TEXT(CFG_INCOME,"${CURRENCY_FORMAT_WHOLE}")&"   ·   assigned "&TEXT(${assignedF.substring(1)},"${CURRENCY_FORMAT_WHOLE}")&"   ·   to assign ","")`)
+    .setFontColor('#FFFFFF').setFontSize(10).setVerticalAlignment('middle')
+    .setHorizontalAlignment('right');
+  sheet.getRange(12, 11)
+    .setFormula(`=IFERROR(CFG_INCOME-${assignedF.substring(1)},"")`)
+    .setNumberFormat(CURRENCY_FORMAT)
+    .setFontColor('#FFFFFF').setFontWeight('bold').setFontSize(11)
+    .setVerticalAlignment('middle')
+    .setNote('Zero is the target. Positive = dollars with no job yet. ' +
+      'Negative = the plan assigns more than you earn, and something will have to give.');
+
   // --- Alerts ----------------------------------------------------------
-  dashSectionHeader(sheet, 13, '⚠️ NEEDS ATTENTION');
+  const ALERT_HEADER_ROW = 14;   // row 13 stays blank: two stacked header
+  const ALERT_FIRST_ROW = 15;    // bars read as one bar and hide the divide
+  dashSectionHeader(sheet, ALERT_HEADER_ROW, '⚠️ NEEDS ATTENTION');
   // Each alert returns either "" (stay silent) or one sentence naming the
   // problem and the fix. An alert that fires constantly stops being read, so
   // every one of these is conditional on a threshold actually being crossed.
@@ -707,6 +729,8 @@ function buildDashboardSheet(ss) {
   const neverAmortize = `COUNTIF('${D}'!$I:$I,"*never*")`;
   const drifted = `COUNTIF('${R}'!$N:$N,">0.01")`;
   const alerts = [
+    `=IFERROR(IF(N($K$12)>=0,"","• Over-assigned by "&TEXT(-$K$12,"${CURRENCY_FORMAT}")&" this month — the plan plans to spend money that is not there. Cut a category or raise planned income."),"")`,
+    `=IFERROR(IF(OR($K$12<=0,$K$12<25),"","• "&TEXT($K$12,"${CURRENCY_FORMAT}")&" of income has no job yet. Assign it before the month starts, or it will be spent by default."),"")`,
     `=IF(${uncategorized}=0,"","• "&${uncategorized}&" transaction(s) have no category. Run 💰 Finance ▸ Apply Categorization Rules.")`,
     `=IF(N($E$10)=0,"","• "&$E$10&" categor"&IF($E$10=1,"y is","ies are")&" over budget this month — see the table below.")`,
     `=IFERROR(IF($K$6="","",IF($K$6>=CFG_EF_MONTHS,"","• Emergency fund covers "&TEXT($K$6,"0.0")&" months of essentials, short of your "&TEXT(CFG_EF_MONTHS,"0")&"-month target.")),"")`,
@@ -717,13 +741,13 @@ function buildDashboardSheet(ss) {
     `=IF(COUNTA('${T}'!$A${DATA_START_ROW}:$A)>0,"","• No transactions yet. Paste a bank export on the Import tab, or try 💰 Finance ▸ Load Sample Data.")`,
   ];
   alerts.forEach((f, i) => {
-    sheet.getRange(14 + i, 1).setFormula(f.replace(/\s*\n\s*/g, ' '))
+    sheet.getRange(ALERT_FIRST_ROW + i, 1).setFormula(f.replace(/\s*\n\s*/g, ' '))
       .setFontSize(10).setFontColor('#7A4F01');
   });
-  sheet.getRange(14, 1, alerts.length, DASH_COLS).setBackground('#FFFBF0');
+  sheet.getRange(ALERT_FIRST_ROW, 1, alerts.length, DASH_COLS).setBackground('#FFFBF0');
 
   // --- Budget table + upcoming bills -----------------------------------
-  const tableTop = 14 + alerts.length + 2;
+  const tableTop = ALERT_FIRST_ROW + alerts.length + 2;
   dashSectionHeader(sheet, tableTop, '📊 THIS MONTH BY CATEGORY', 1, 6);
   dashSectionHeader(sheet, tableTop, '🔁 DUE IN THE NEXT 30 DAYS', 7, 6);
 
@@ -894,9 +918,11 @@ function applyDashboardConditionalFormats(sheet, trendTop) {
 //  13. PROJECTIONS
 // ============================================================================
 
+// Row 2 = helper labels, row 3 = helper values, rows 5–9 = the salary
+// scenario block, row 11 = table headers, row 12 = first projected month.
 const PROJ_HELPER_ROW = 2;
-const PROJ_HEADER_ROW = 5;
-const PROJ_DATA_ROW = 6;
+const PROJ_HEADER_ROW = 11;
+const PROJ_DATA_ROW = 12;
 const PROJ_MAX_MONTHS = 600;
 
 /**
@@ -995,6 +1021,38 @@ function buildProjectionsSheet(ss) {
     if (h.note) cell.setNote(h.note);
     try { ss.setNamedRange(h.name, cell); } catch (err) { blog(`named range ${h.name}: ${err}`); }
   });
+
+  // --- Salary scenarios -------------------------------------------------
+  // "What would this offer actually change?" answered in take-home terms.
+  // A gross salary is not comparable to a budget; only net is, and the gap
+  // between them is large enough that comparing offers on gross alone is how
+  // people talk themselves into a raise that does not clear.
+  const SCEN_ROW = PROJ_HELPER_ROW + 3;
+  sheet.getRange(SCEN_ROW, 1, 1, 5)
+    .setValues([['Salary scenario', 'Gross / yr', 'Net / mo', 'vs. plan', 'Verdict']])
+    .setFontWeight('bold').setFontSize(9).setBackground('#E8EEF7');
+
+  const assignedTotal =
+    `IFERROR(SUMIFS('${SHEET_NAMES.BUDGET}'!$H:$H,'${SHEET_NAMES.BUDGET}'!$A:$A,TEXT(TODAY(),"yyyy-mm"),'${SHEET_NAMES.BUDGET}'!$E:$E,"<>${CATEGORY_KINDS.INCOME}"),0)`;
+
+  // Three offsets around the current salary, so the table stays useful as the
+  // salary itself changes rather than hard-coding the numbers of one moment.
+  [['Current', 0], ['−$8k', -8000], ['+$7k', 7000]].forEach((s, i) => {
+    const row = SCEN_ROW + 1 + i;
+    sheet.getRange(row, 1).setValue(s[0]).setFontSize(9);
+    sheet.getRange(row, 2).setFormula(`=CFG_GROSS_SALARY+${s[1]}`)
+      .setNumberFormat(CURRENCY_FORMAT_WHOLE).setFontSize(9);
+    sheet.getRange(row, 3).setFormula(`=B${row}*CFG_TAKEHOME_RATE/12`)
+      .setNumberFormat(CURRENCY_FORMAT).setFontSize(9);
+    sheet.getRange(row, 4).setFormula(`=IFERROR(C${row}-${assignedTotal},"")`)
+      .setNumberFormat(CURRENCY_FORMAT).setFontSize(9);
+    sheet.getRange(row, 5)
+      .setFormula(`=IF(D${row}="","",IF(D${row}<0,"⚠️ short "&TEXT(-D${row},"${CURRENCY_FORMAT}")&"/mo","✅ clears by "&TEXT(D${row},"${CURRENCY_FORMAT}")&"/mo"))`)
+      .setFontSize(9);
+  });
+  sheet.getRange(SCEN_ROW + 4, 1)
+    .setValue('Net/mo uses your take-home rate from Setup. "vs. plan" compares it to everything currently assigned on Budget_Monthly.')
+    .setFontSize(8).setFontStyle('italic').setFontColor(KPI_LABEL_COLOR);
 
   // --- Table -----------------------------------------------------------
   const headers = [

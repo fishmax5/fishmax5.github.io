@@ -128,6 +128,27 @@ noise produces budgets nobody keeps.
 
 ---
 
+## To Assign: the zero-based check
+
+The Dashboard's **Zero-Based Check** bar shows `planned income − everything assigned`.
+
+**Zero is the target.** Positive means dollars have no job yet and will get spent by
+default. Negative means the plan promises money that isn't there.
+
+This is the number a plan can fail on while every individual line still looks
+reasonable — you only see over-commitment in the total. Two Dashboard alerts watch it:
+one fires when you're over-assigned, one when more than $25 is sitting unassigned.
+
+## Salary scenarios
+
+The Projections tab compares your current salary against a lower and higher one, in
+**take-home** terms, and says whether each clears the budget you've actually assigned.
+
+Gross salary isn't comparable to a budget; only net is. Set your **take-home rate** on
+Setup from a real payslip rather than guessing — the gap between gross and net is large
+enough that comparing offers on gross alone is how people talk themselves into a raise
+that doesn't clear.
+
 ## Budget_Monthly: the envelope budget
 
 ```

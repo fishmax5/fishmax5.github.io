@@ -739,36 +739,41 @@ function snapshotNetWorth() {
  * [category, group, kind, method, amount, percent, rollover]
  */
 const DEFAULT_CATEGORIES = [
-  ['Salary', 'Income', CATEGORY_KINDS.INCOME, TARGET_METHODS.FIXED, 6000, '', false],
+  ['Salary', 'Income', CATEGORY_KINDS.INCOME, TARGET_METHODS.FIXED, 3395, '', false],
+  ['Family Support', 'Income', CATEGORY_KINDS.INCOME, TARGET_METHODS.FIXED, 100, '', false],
   ['Side Income', 'Income', CATEGORY_KINDS.INCOME, TARGET_METHODS.NONE, '', '', false],
   ['Interest & Dividends', 'Income', CATEGORY_KINDS.INCOME, TARGET_METHODS.NONE, '', '', false],
 
-  ['Rent / Mortgage', 'Housing', CATEGORY_KINDS.ESSENTIAL, TARGET_METHODS.FIXED, 1800, '', false],
-  ['Utilities', 'Housing', CATEGORY_KINDS.ESSENTIAL, TARGET_METHODS.ROLLING, '', '', true],
-  ['Internet & Phone', 'Housing', CATEGORY_KINDS.ESSENTIAL, TARGET_METHODS.FIXED, 120, '', false],
-  ['Groceries', 'Food', CATEGORY_KINDS.ESSENTIAL, TARGET_METHODS.ROLLING, '', '', true],
-  ['Transport & Fuel', 'Transport', CATEGORY_KINDS.ESSENTIAL, TARGET_METHODS.ROLLING, '', '', true],
-  ['Insurance', 'Insurance', CATEGORY_KINDS.ESSENTIAL, TARGET_METHODS.FIXED, 200, '', false],
-  ['Healthcare', 'Health', CATEGORY_KINDS.ESSENTIAL, TARGET_METHODS.ROLLING, '', '', true],
+  // Essentials. Travel and Apple are Essential because that is how the source
+  // budget classified them (they reconcile to its stated 52.84% needs share),
+  // not because the labels suggest it.
+  ['Rent', 'Housing', CATEGORY_KINDS.ESSENTIAL, TARGET_METHODS.FIXED, 650, '', false],
+  ['Utilities', 'Housing', CATEGORY_KINDS.ESSENTIAL, TARGET_METHODS.FIXED, 100, '', true],
+  ['Groceries', 'Food', CATEGORY_KINDS.ESSENTIAL, TARGET_METHODS.ROLLING, 300, '', true],
+  ['Health', 'Health', CATEGORY_KINDS.ESSENTIAL, TARGET_METHODS.FIXED, 200, '', true],
+  ['Travel', 'Transport', CATEGORY_KINDS.ESSENTIAL, TARGET_METHODS.FIXED, 540, '', true],
+  ['Car Insurance', 'Insurance', CATEGORY_KINDS.ESSENTIAL, TARGET_METHODS.FIXED, 0, '', true],
+  ['Phone', 'Utilities', CATEGORY_KINDS.ESSENTIAL, TARGET_METHODS.FIXED, 0, '', false],
+  ['Apple', 'Services', CATEGORY_KINDS.ESSENTIAL, TARGET_METHODS.FIXED, 4, '', false],
 
-  ['Dining Out', 'Food', CATEGORY_KINDS.LIFESTYLE, TARGET_METHODS.ROLLING, '', '', true],
-  ['Groceries — Treats', 'Food', CATEGORY_KINDS.LIFESTYLE, TARGET_METHODS.NONE, '', '', true],
-  ['Entertainment', 'Lifestyle', CATEGORY_KINDS.LIFESTYLE, TARGET_METHODS.FIXED, 100, '', true],
-  ['Shopping', 'Lifestyle', CATEGORY_KINDS.LIFESTYLE, TARGET_METHODS.ROLLING, '', '', true],
-  ['Travel', 'Lifestyle', CATEGORY_KINDS.LIFESTYLE, TARGET_METHODS.FIXED, 200, '', true],
-  ['Subscriptions', 'Lifestyle', CATEGORY_KINDS.LIFESTYLE, TARGET_METHODS.FIXED, 60, '', false],
-  ['Fitness', 'Health', CATEGORY_KINDS.LIFESTYLE, TARGET_METHODS.FIXED, 40, '', false],
-  ['Personal Care', 'Lifestyle', CATEGORY_KINDS.LIFESTYLE, TARGET_METHODS.ROLLING, '', '', false],
-  ['Gifts & Giving', 'Giving', CATEGORY_KINDS.LIFESTYLE, TARGET_METHODS.PERCENT, '', 0.02, true],
+  // Wants. Political giving is a standing budget line here, not an occasional
+  // gift, so each recipient gets its own category rather than one Donations
+  // bucket — you cannot notice a lapsed commitment inside an aggregate.
+  ['Personal', 'Lifestyle', CATEGORY_KINDS.LIFESTYLE, TARGET_METHODS.FIXED, 500, '', true],
+  ['System', 'Lifestyle', CATEGORY_KINDS.LIFESTYLE, TARGET_METHODS.FIXED, 300, '', true],
+  ['DSA', 'Giving', CATEGORY_KINDS.LIFESTYLE, TARGET_METHODS.FIXED, 15, '', false],
+  ['NEC', 'Giving', CATEGORY_KINDS.LIFESTYLE, TARGET_METHODS.FIXED, 10, '', false],
+  ['Our Revolution', 'Giving', CATEGORY_KINDS.LIFESTYLE, TARGET_METHODS.FIXED, 5, '', false],
+  ['Strong Towns', 'Giving', CATEGORY_KINDS.LIFESTYLE, TARGET_METHODS.FIXED, 3.5, '', false],
+  ['Dropout', 'Subscriptions', CATEGORY_KINDS.LIFESTYLE, TARGET_METHODS.FIXED, 5, '', false],
+  ['Music', 'Subscriptions', CATEGORY_KINDS.LIFESTYLE, TARGET_METHODS.FIXED, 0, '', false],
 
-  ['Emergency Fund', 'Savings', CATEGORY_KINDS.SAVINGS, TARGET_METHODS.PERCENT, '', 0.05, true],
-  ['Retirement', 'Savings', CATEGORY_KINDS.SAVINGS, TARGET_METHODS.PERCENT, '', 0.10, false],
-  ['Brokerage', 'Savings', CATEGORY_KINDS.SAVINGS, TARGET_METHODS.PERCENT, '', 0.05, false],
-  ['Sinking Funds', 'Savings', CATEGORY_KINDS.SAVINGS, TARGET_METHODS.FIXED, 150, '', true],
+  ['Save', 'Savings', CATEGORY_KINDS.SAVINGS, TARGET_METHODS.FIXED, 650, '', true],
+  ['Emergency Save', 'Savings', CATEGORY_KINDS.SAVINGS, TARGET_METHODS.FIXED, 200, '', true],
+  ['Retirement', 'Savings', CATEGORY_KINDS.SAVINGS, TARGET_METHODS.NONE, '', '', false],
 
   ['Credit Card Payment', 'Debt', CATEGORY_KINDS.DEBT, TARGET_METHODS.FIXED, '', '', false],
   ['Student Loan', 'Debt', CATEGORY_KINDS.DEBT, TARGET_METHODS.FIXED, '', '', false],
-  ['Auto Loan', 'Debt', CATEGORY_KINDS.DEBT, TARGET_METHODS.FIXED, '', '', false],
 ];
 
 function seedDefaultCategoriesIfEmpty(ss) {
