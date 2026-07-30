@@ -625,6 +625,13 @@ const BUDGET_SPEC = {
       formula: `=IF($C{r}="","",$H{r}+$L{r}-$I{r})` },
     { key: 'rowkey', label: 'Row_Key', width: 160, computed: true, hidden: true,
       formula: `=IF($C{r}="","",$A{r}&"|"&$C{r})` },
+    // A conditional format rule may not reference another sheet — not even
+    // through a named range — but a CELL formula may. So the alert threshold
+    // is mirrored into one cell on this tab (the first data row) and the rule
+    // reads that cell locally. Without this the whole tab fails to build.
+    { key: 'cfgalert', label: 'Cfg_Alert_Pct', width: 90, computed: true, hidden: true,
+      formula: `=IF(ROW()=${DATA_START_ROW},IFERROR(CFG_ALERT_PCT,0.9),"")`,
+      note: 'Local mirror of CFG_ALERT_PCT from Setup. Exists only because conditional formatting cannot read across sheets.' },
   ],
 };
 

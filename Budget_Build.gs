@@ -357,9 +357,12 @@ function applyConditionalFormats(sheet, spec, lastRow) {
         .whenFormulaSatisfied(`=AND($C${DATA_START_ROW}<>"",$E${DATA_START_ROW}<>"${CATEGORY_KINDS.INCOME}",$${avail}${DATA_START_ROW}<0)`)
         .setBackground(BAD_BG).setFontColor(BAD_COLOR)
         .setRanges([all()]).build());
-      // Approaching the limit (CFG_ALERT_PCT..100%): amber, on the % cell only.
+      // Approaching the limit (threshold..100%): amber, on the % cell only.
+      // The threshold is read from the same-sheet mirror cell, not from the
+      // CFG_ALERT_PCT named range — see the Cfg_Alert_Pct column's note.
+      const alertRef = `$${colL(spec, 'cfgalert')}$${DATA_START_ROW}`;
       rules.push(SpreadsheetApp.newConditionalFormatRule()
-        .whenFormulaSatisfied(`=AND($${pct}${DATA_START_ROW}<>"",$E${DATA_START_ROW}<>"${CATEGORY_KINDS.INCOME}",$${pct}${DATA_START_ROW}>=CFG_ALERT_PCT,$${pct}${DATA_START_ROW}<=1)`)
+        .whenFormulaSatisfied(`=AND($${pct}${DATA_START_ROW}<>"",$E${DATA_START_ROW}<>"${CATEGORY_KINDS.INCOME}",$${pct}${DATA_START_ROW}>=${alertRef},$${pct}${DATA_START_ROW}<=1)`)
         .setBackground(WARN_BG).setFontColor(WARN_COLOR)
         .setRanges([colRange('pct')]).build());
       // A manual override is a fact worth seeing at a glance.
@@ -623,8 +626,10 @@ function buildDashboardSheet(ss) {
   sheet.getRange(1, 1, Math.max(sheet.getMaxRows(), 90), Math.max(sheet.getMaxColumns(), DASH_COLS))
     .breakApart();
 
-  if (sheet.getMaxColumns() < DASH_COLS) {
-    sheet.insertColumnsAfter(sheet.getMaxColumns(), DASH_COLS - sheet.getMaxColumns());
+  // 14, not DASH_COLS: columns M–N hold the hidden config mirror cells that
+  // the conditional formats read (see below).
+  if (sheet.getMaxColumns() < 14) {
+    sheet.insertColumnsAfter(sheet.getMaxColumns(), 14 - sheet.getMaxColumns());
   }
   if (sheet.getMaxRows() < 90) {
     sheet.insertRowsAfter(sheet.getMaxRows(), 90 - sheet.getMaxRows());
@@ -850,6 +855,13 @@ function buildDashboardSheet(ss) {
     .setNumHeaders(1)
     .build());
 
+  // Same-sheet mirrors of the two Setup targets the conditional formats below
+  // compare against. Conditional formatting cannot reach another sheet, so
+  // these cells sit off to the right of the visible dashboard and are hidden.
+  sheet.getRange(1, 14).setFormula('=IFERROR(CFG_SAVINGS_TARGET,0.2)');
+  sheet.getRange(2, 14).setFormula('=IFERROR(CFG_EF_MONTHS,6)');
+  sheet.hideColumns(14);
+
   sheet.setFrozenRows(2);
   applyDashboardConditionalFormats(sheet, trendTop);
   blog('built Dashboard');
@@ -904,14 +916,15 @@ function applyDashboardConditionalFormats(sheet, trendTop) {
   rules.push(SpreadsheetApp.newConditionalFormatRule()
     .whenNumberGreaterThan(0).setFontColor(GOOD_COLOR)
     .setRanges([sheet.getRange(6, 7, 1, 2), sheet.getRange(trendTop + 2, 4, 12, 1)]).build());
-  // Savings rate tile against target.
+  // Savings rate and emergency fund against their targets, read from the
+  // hidden same-sheet mirror cells in column N rather than from the CFG_*
+  // named ranges, which conditional formatting cannot reach.
   rules.push(SpreadsheetApp.newConditionalFormatRule()
-    .whenFormulaSatisfied('=AND($I$6<>"",$I$6<CFG_SAVINGS_TARGET)')
+    .whenFormulaSatisfied('=AND($I$6<>"",$I$6<$N$1)')
     .setFontColor(WARN_COLOR)
     .setRanges([sheet.getRange(6, 9, 1, 2)]).build());
-  // Emergency fund against target.
   rules.push(SpreadsheetApp.newConditionalFormatRule()
-    .whenFormulaSatisfied('=AND($K$6<>"",$K$6<CFG_EF_MONTHS)')
+    .whenFormulaSatisfied('=AND($K$6<>"",$K$6<$N$2)')
     .setFontColor(WARN_COLOR)
     .setRanges([sheet.getRange(6, 11, 1, 2)]).build());
   // Over-budget count.
