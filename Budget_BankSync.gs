@@ -288,22 +288,45 @@ function sfFetch(path, params) {
 
 /** Fetch accounts, optionally with transactions in a date window. */
 function sfGetAccounts(startDate, endDate, withTransactions) {
-  const params = {};
+  // version=2 pins the current protocol. Without it the Bridge may answer in
+  // the legacy shape, where the fields below are named differently.
+  const params = { version: 2 };
   if (withTransactions) {
     params['start-date'] = Math.floor(startDate.getTime() / 1000);
     if (endDate) params['end-date'] = Math.floor(endDate.getTime() / 1000);
+    // NOT requesting pending. Pending rows are excluded by default and that is
+    // what we want — they change amount and description before settling, so a
+    // pending row would contradict its own settled version a day later.
   } else {
     params['balances-only'] = 1;
   }
   const data = sfFetch('/accounts', params);
 
-  // The Bridge reports per-institution problems in an errors array while still
-  // returning 200 with whatever else succeeded. Surfacing these matters: a
-  // silently stale account looks identical to one with no activity.
-  if (data.errors && data.errors.length) {
-    blog('bank: provider errors: ' + JSON.stringify(data.errors));
-  }
+  // Per-institution problems come back alongside a 200 with whatever else
+  // succeeded. Surfacing them matters: a silently stale account looks exactly
+  // like one with no activity. v2 calls this errlist; `errors` is the
+  // deprecated v1 name, kept as a fallback.
+  const errs = data.errlist || data.errors || [];
+  if (errs.length) blog('bank: provider errors: ' + JSON.stringify(errs));
+  data.__errors = errs;
+
+  // v2 moved institution identity out of each account and into a top-level
+  // connections array, keyed by conn_id. Older payloads still inline `org`.
+  const connById = {};
+  (data.connections || []).forEach(c => {
+    if (c && c.id) connById[String(c.id)] = c;
+  });
+  data.__connById = connById;
+
   return data;
+}
+
+/** Institution label for an account, across both protocol shapes. */
+function sfOrgName(acct, connById) {
+  if (acct.org) return String(acct.org.name || acct.org.domain || '');
+  const c = connById && acct.conn_id ? connById[String(acct.conn_id)] : null;
+  if (c) return String(c.name || c.org || c.domain || '');
+  return '';
 }
 
 
@@ -367,7 +390,7 @@ function linkBankAccounts() {
       if (!id) return;
       if (alreadyMapped[id]) { skipped++; return; }
 
-      const org = (acct.org && (acct.org.name || acct.org.domain)) || '';
+      const org = sfOrgName(acct, data.__connById);
       const label = String(acct.name || 'Account');
       const idx = byName[label.toLowerCase()];
 
@@ -523,13 +546,14 @@ function syncBank() {
         const posted = new Date(Number(t.posted) * 1000);
         if (isNaN(posted.getTime())) return;
 
-        // payee is the cleaned merchant name where the provider has one;
-        // description is the raw statement line. Prefer the clean one, keep
-        // the raw one in Notes so the rules engine has something to match on
-        // when the clean name is too generic.
-        const payee = String(t.payee || t.description || '').trim();
-        const memo = String(t.memo || '').trim();
+        // `description` is the only text field the protocol guarantees.
+        // `payee` and `memo` are Bridge extensions that may be absent — used
+        // when present because a cleaned merchant name makes far better rule
+        // material than a raw statement line, with description as the
+        // fallback and also kept in Notes when it differs.
         const desc = String(t.description || '').trim();
+        const payee = String(t.payee || desc).trim();
+        const memo = String(t.memo || '').trim();
 
         const row = new Array(nTxnCols).fill('');
         row[colOf(TRANSACTIONS_SPEC, 'date') - 1] = posted;
@@ -572,7 +596,7 @@ function syncBank() {
     sfProps().setProperty(SF_LAST_SYNC_KEY, String(Date.now()));
     if (imported) applyRules();
 
-    const errs = (data.errors || []).length;
+    const errs = (data.__errors || []).length;
     ui.alert('Sync complete',
       `New transactions:  ${imported}\n` +
       `Pending (skipped): ${pendingSkipped}\n` +
@@ -697,7 +721,7 @@ function showBankStatus() {
   try {
     const d = sfGetAccounts(null, null, false);
     reachable = `✅ reachable — ${(d.accounts || []).length} account(s) at the Bridge` +
-      ((d.errors || []).length ? `, ${d.errors.length} institution error(s)` : '');
+      ((d.__errors || []).length ? `, ${d.__errors.length} institution error(s)` : '');
   } catch (err) {
     reachable = '⚠️ ' + String(err.message || err);
   }
