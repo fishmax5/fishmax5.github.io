@@ -44,6 +44,8 @@ function buildMenu() {
     .addItem('🔁  Detect Recurring Bills', 'detectRecurring')
     .addItem('📸  Snapshot Net Worth (this month)', 'snapshotNetWorth')
     .addSeparator()
+    .addSubMenu(buildBankSyncMenu(ui))
+    .addSeparator()
     .addSubMenu(ui.createMenu('🧪  Sample Data')
       .addItem('Load Sample Data', 'seedSampleData')
       .addItem('Clear ALL Data', 'clearAllData'))

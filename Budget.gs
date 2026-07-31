@@ -495,6 +495,11 @@ const ACCOUNTS_SPEC = {
       formula: `=IF(OR($A{r}="",N($G{r})=0),"",MIN(1,ABS(MIN(0,$J{r}))/$G{r}))`,
       note: 'Balance owed ÷ credit limit. Amber over 30%, red over 50%.' },
     { key: 'notes', label: 'Notes', width: 220 },
+    // Appended deliberately at the END of the spec: every formula in this
+    // workbook addresses Accounts by column letter, so inserting a column
+    // anywhere earlier would silently repoint ~15 SUMIFS at the wrong data.
+    { key: 'syncid', label: 'Bank_Sync_ID', width: 200,
+      note: 'Filled in by 🏦 Bank Sync ▸ Link Accounts. Maps this row to an account at your bank aggregator. Clear it to stop syncing this account.' },
   ],
 };
 
@@ -577,7 +582,14 @@ const TRANSACTIONS_SPEC = {
       formula: `=IF($A{r}="","",TEXT($A{r},"yyyymmdd")&"|"&$B{r}&"|"&TEXT($E{r},"0.00")&"|"&LOWER(TRIM($C{r})))`,
       note: 'Dedupe key for CSV import: date + account + amount + payee. Two genuinely identical charges on one day at one merchant WILL collide — the importer reports these rather than dropping them silently.' },
     { key: 'source', label: 'Source', width: 110, hidden: true,
-      note: 'Manual, Import, or Sample.' },
+      note: 'Manual, Import, Sample, or Bank Sync.' },
+    // Appended at the END for the same reason as Accounts.Bank_Sync_ID.
+    // This is a far better dedupe key than Tx_Hash: the bank assigns it, so
+    // two identical charges on the same day at the same merchant are still
+    // distinguishable. Bank-synced rows dedupe on this; CSV rows fall back to
+    // the hash, because a CSV export has no stable ID.
+    { key: 'bankid', label: 'Bank_Txn_ID', width: 200, hidden: true,
+      note: 'Provider-assigned transaction ID. Present only on bank-synced rows. Do not edit — clearing it can cause a duplicate on the next sync.' },
   ],
 };
 
