@@ -194,6 +194,24 @@ payee string.
 
 ---
 
+## Auto-categorization after every sync
+
+Every bank sync and CSV import now runs a two-pass pipeline automatically — no menu
+click required:
+
+1. **Rules** (below) — your explicit, ordered matches.
+2. **History fill** — whatever Rules left blank gets filled from how *you already
+   categorized that same payee* elsewhere in the ledger, no rule needed. It only acts
+   on a real majority (≥80% of that payee's history, 2+ occurrences); a merchant split
+   between two categories stays blank rather than guessing wrong, because a silently
+   wrong category is harder to notice than an empty one.
+
+**💰 Finance ▸ 🧠 Auto-Categorize ▸ Generate Rules from History…** turns that pattern
+into a durable Rule: any payee with 3+ consistently-categorized transactions (≥85%
+agreement) and no existing active rule becomes a proposed Rule row, shown for
+confirmation before anything is written. Run it occasionally — each pass makes future
+syncs need less correction, not just this one.
+
 ## Rules: auto-categorization
 
 Match text on a payee, set the category. Two invariants:
@@ -231,6 +249,28 @@ the estimate.
 
 It proposes; it doesn't decide. New entries arrive with status **Watch** so they're
 visibly unreviewed, and nothing already on the tab is modified.
+
+**Detection now covers income too** — paychecks and other recurring deposits, not just
+bills. Income gets a wider amount-stability tolerance (±50% vs. ±35% for bills) since
+overtime and bonuses move a paycheck by more than a subscription price ever should.
+Every bank sync silently checks for new candidates and mentions the count in its
+summary — nothing is written until you run **Detect Recurring Bills & Income** and
+confirm.
+
+Recurring rows are tagged with the linked category's **Kind** (a lookup column, not a
+hand-typed one), so a paycheck row and a subscription row on the same tab are told
+apart everywhere else in the workbook automatically.
+
+### Detected income vs. your plan
+
+The Dashboard's **Detected Income** bar totals every *Active* Recurring row tagged
+`Income` and compares it to `CFG_INCOME` on Setup. It's a live formula, not a
+script-maintained number — mark a new paycheck stream Active and the total updates
+immediately.
+
+**It never writes to Setup for you.** A drift of $100+/month triggers a Dashboard
+alert, but updating `CFG_INCOME` is always your call — same principle as
+`Budget_Override`: computed values inform, you decide.
 
 ---
 

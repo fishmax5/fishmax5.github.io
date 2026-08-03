@@ -654,8 +654,8 @@ const BUDGET_SPEC = {
 
 const RECURRING_SPEC = {
   name: SHEET_NAMES.RECURRING,
-  title: '🔁 Recurring — bills and subscriptions',
-  subtitle: 'Annualized is the column that changes behavior. $14.99/mo is easy to keep; $179.88/yr is a decision. Sort by it before you review anything else.',
+  title: '🔁 Recurring — bills, subscriptions, and recurring income',
+  subtitle: 'Annualized is the column that changes behavior. $14.99/mo is easy to keep; $179.88/yr is a decision. A row here can be a bill OR a paycheck — Category ▸ Kind on the linked category is what tells them apart everywhere else in the workbook.',
   frozenColumns: 1,
   columns: [
     { key: 'name', label: 'Name', width: 170,
@@ -689,6 +689,14 @@ const RECURRING_SPEC = {
       note: 'Most recent charge minus the amount you recorded. Non-zero means the price changed and you may not have noticed — the reason subscription creep works.',
       formula: `=IF(OR($A{r}="",$L{r}=""),"",IFERROR(ABS(SUMIFS('${SHEET_NAMES.TRANSACTIONS}'!$E:$E,'${SHEET_NAMES.TRANSACTIONS}'!$H:$H,$A{r},'${SHEET_NAMES.TRANSACTIONS}'!$A:$A,$L{r}))-N($C{r}),""))` },
     { key: 'notes', label: 'Notes', width: 200 },
+    // Appended at the end, same reasoning as Accounts.Bank_Sync_ID: every
+    // formula elsewhere addresses this tab by column letter. This exists so
+    // the Dashboard's detected-income total can be a plain SUMIFS instead of
+    // an array-lookup formula — a category's Kind, looked up once per row,
+    // right where a Recurring row is also easiest for a human to read as
+    // "this is income" vs. "this is a bill."
+    { key: 'kind', label: 'Kind', width: 90, computed: true,
+      formula: `=IF($A{r}="","",IFERROR(INDEX('${SHEET_NAMES.CATEGORIES}'!$C:$C,MATCH($G{r},'${SHEET_NAMES.CATEGORIES}'!$A:$A,0)),""))` },
   ],
 };
 

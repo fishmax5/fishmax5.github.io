@@ -39,9 +39,13 @@ function buildMenu() {
     .addItem('▶️  Initialize / Repair Workbook', 'initWorkbook')
     .addSeparator()
     .addItem('🔄  Rebuild Budget Months', 'rebuildBudgetMonths')
-    .addItem('⚙️  Apply Categorization Rules', 'applyRules')
     .addItem('📥  Import Staged Rows', 'importStagedRows')
-    .addItem('🔁  Detect Recurring Bills', 'detectRecurring')
+    .addSubMenu(ui.createMenu('🧠  Auto-Categorize')
+      .addItem('Apply Rules + History (what runs after every sync)', 'autoCategorizeTransactions')
+      .addItem('Apply Rules only', 'applyRules')
+      .addItem('Fill from History only', 'historyFillCategories')
+      .addItem('Generate Rules from History…', 'generateRulesFromHistory'))
+    .addItem('🔁  Detect Recurring Bills & Income', 'detectRecurring')
     .addItem('📸  Snapshot Net Worth (this month)', 'snapshotNetWorth')
     .addSeparator()
     .addSubMenu(buildBankSyncMenu(ui))
@@ -733,9 +737,32 @@ function buildDashboardSheet(ss) {
     .setNote('Zero is the target. Positive = dollars with no job yet. ' +
       'Negative = the plan assigns more than you earn, and something will have to give.');
 
+  // --- Detected income: what 🔁 Detect Recurring Bills & Income actually
+  // found in the ledger, versus what Setup assumes. This is read from the
+  // Recurring tab's Kind column (a category lookup written there for exactly
+  // this reason — see RECURRING_SPEC), so it is a genuine SUMIFS, not a
+  // script-maintained figure, and it updates the moment a new paycheck row
+  // gets marked Active. It never writes CFG_INCOME itself: Setup stays yours
+  // to change, same principle as Budget_Override.
+  const detectedAnnualF =
+    `SUMIFS('${R}'!$J:$J,'${R}'!$H:$H,"Active",'${R}'!$P:$P,"${CATEGORY_KINDS.INCOME}")`;
+  dashSectionHeader(sheet, 13, '💵 DETECTED INCOME (from recurring paychecks & deposits)');
+  sheet.getRange(13, 5)
+    .setFormula(`=IFERROR(IF(${detectedAnnualF}=0,"No income streams detected yet — run 🔁 Detect Recurring Bills & Income after a sync.","Detected "&TEXT(${detectedAnnualF}/12,"${CURRENCY_FORMAT_WHOLE}")&"/mo   ·   planned "&TEXT(CFG_INCOME,"${CURRENCY_FORMAT_WHOLE}")&"/mo"),"")`)
+    .setFontColor('#FFFFFF').setFontSize(10).setVerticalAlignment('middle')
+    .setHorizontalAlignment('right');
+  sheet.getRange(13, 11)
+    .setFormula(`=IFERROR(IF(${detectedAnnualF}=0,"",${detectedAnnualF}/12-CFG_INCOME),"")`)
+    .setNumberFormat(CURRENCY_FORMAT)
+    .setFontColor('#FFFFFF').setFontWeight('bold').setFontSize(11)
+    .setVerticalAlignment('middle')
+    .setNote('Detected monthly income minus CFG_INCOME on Setup. A nonzero value usually ' +
+      'means a raise, a new side income stream, or a lost paycheck was detected before you ' +
+      'updated Setup by hand — Setup is never changed automatically.');
+
   // --- Alerts ----------------------------------------------------------
-  const ALERT_HEADER_ROW = 14;   // row 13 stays blank: two stacked header
-  const ALERT_FIRST_ROW = 15;    // bars read as one bar and hide the divide
+  const ALERT_HEADER_ROW = 15;   // row 14 stays blank: the two bars above
+  const ALERT_FIRST_ROW = 16;    // sit adjacent on purpose and read as one block
   dashSectionHeader(sheet, ALERT_HEADER_ROW, '⚠️ NEEDS ATTENTION');
   // Each alert returns either "" (stay silent) or one sentence naming the
   // problem and the fix. An alert that fires constantly stops being read, so
@@ -752,6 +779,7 @@ function buildDashboardSheet(ss) {
     `=IFERROR(IF($I$6="","",IF($I$6>=CFG_SAVINGS_TARGET,"","• Savings rate is "&TEXT($I$6,"0.0%")&" against a "&TEXT(CFG_SAVINGS_TARGET,"0%")&" target.")),"")`,
     `=IFERROR(IF(${neverAmortize}=0,"","• "&${neverAmortize}&" debt(s) will never amortize at the current payment — the payment does not cover the interest."),"")`,
     `=IFERROR(IF(${drifted}=0,"","• "&${drifted}&" subscription(s) charged more than the amount on record — check Price_Drift."),"")`,
+    `=IFERROR(IF(OR($K$13="",ABS($K$13)<100),"","• Detected income is "&TEXT($K$13,"+${CURRENCY_FORMAT};-${CURRENCY_FORMAT}")&"/mo vs. your Setup plan — update CFG_INCOME if this is real, not noise."),"")`,
     `=IF(COUNTA('${A}'!$A${DATA_START_ROW}:$A)>0,"","• No accounts yet. Add them on the Accounts tab — nothing else can compute until you do.")`,
     `=IF(COUNTA('${T}'!$A${DATA_START_ROW}:$A)>0,"","• No transactions yet. Paste a bank export on the Import tab, or try 💰 Finance ▸ Load Sample Data.")`,
   ];

@@ -594,7 +594,16 @@ function syncBank() {
     }
 
     sfProps().setProperty(SF_LAST_SYNC_KEY, String(Date.now()));
-    if (imported) applyRules();
+    let cat = { rules: 0, history: 0 };
+    let newRecurring = 0;
+    if (imported) {
+      cat = autoCategorizeTransactions(true);
+      // Detection only PROPOSES here — see computeRecurringProposals(). A
+      // sync happening in the background is the wrong moment to pop a
+      // confirmation dialog; the count below just tells you there's
+      // something worth reviewing with 🔁 Detect Recurring Bills & Income.
+      newRecurring = computeRecurringProposals().length;
+    }
 
     const errs = (data.__errors || []).length;
     ui.alert('Sync complete',
@@ -603,7 +612,9 @@ function syncBank() {
       `Unlinked accounts: ${unmapped}\n` +
       (errs ? `\n⚠️ The Bridge reported ${errs} institution error(s). Some accounts may be stale — ` +
               `check bridge.simplefin.org.\n` : '') +
-      (imported ? '\nCategorization rules were applied to the new rows.' : '') +
+      (imported ? `\nCategorized automatically: ${cat.rules} by rule, ${cat.history} from your history.` : '') +
+      (newRecurring ? `\n🔁 ${newRecurring} possible recurring bill(s) or income deposit(s) detected — ` +
+                      `review with 💰 Finance ▸ 🔁 Detect Recurring Bills & Income.` : '') +
       '\n\nBalances on the Accounts tab are derived from Opening_Balance plus these ' +
       'transactions. If one disagrees with your bank, the opening balance or its ' +
       'as-of date is wrong — not the ledger.',

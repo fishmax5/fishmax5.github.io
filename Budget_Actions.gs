@@ -189,7 +189,20 @@ function rebuildBudgetMonths(silent) {
  *   2. First match by priority wins, so specific rules can be ordered above
  *      general ones ("Amazon Prime" → Subscriptions before "Amazon" → Shopping).
  */
-function applyRules() {
+/**
+ * The full auto-categorization pipeline, run after every sync/import:
+ *   1. applyRules()          — explicit Rules tab, in priority order
+ *   2. historyFillCategories() — whatever's still blank, filled from how YOU
+ *      categorized the same payee everywhere else in the ledger
+ * Order matters: an explicit rule always wins over an inferred one.
+ */
+function autoCategorizeTransactions(silent) {
+  const r = applyRules(silent);
+  const h = historyFillCategories(silent);
+  return { rules: r || 0, history: h || 0 };
+}
+
+function applyRules(silent) {
   return withLock('rules', () => {
     const txns = sheet_(SHEET_NAMES.TRANSACTIONS);
     const rulesSheet = sheet_(SHEET_NAMES.RULES);
@@ -209,9 +222,16 @@ function applyRules() {
       .filter(r => r.active && r.matchText !== '' && r.category !== '');
 
     if (!rules.length) {
-      SpreadsheetApp.getUi().alert(
-        'No active rules yet.\n\nAdd them on the Rules tab: match text from a payee, the category to set, ' +
-        'and tick Active. Rules run in Priority order and only fill blank categories.');
+      // A blocking alert here would fire on every sync for anyone who hasn't
+      // written a rule yet — silent callers (autoCategorizeTransactions from
+      // a sync/import) just skip this pass instead.
+      if (!silent) {
+        SpreadsheetApp.getUi().alert(
+          'No active rules yet.\n\nAdd them on the Rules tab: match text from a payee, the category to set, ' +
+          'and tick Active. Rules run in Priority order and only fill blank categories.\n\n' +
+          'Or run 💰 Finance ▸ 🧠 Auto-Categorize ▸ Generate Rules from History to build them ' +
+          'from how you\'ve already categorized past transactions.');
+      }
       return 0;
     }
     rules.sort((a, b) => a.priority - b.priority);
@@ -266,6 +286,159 @@ function applyRules() {
       '⚙️ Rules applied', 6);
     blog(`applyRules: ${applied} applied, ${remaining} remaining`);
     return applied;
+  });
+}
+
+/**
+ * Second-pass categorization: for whatever the Rules tab left blank, fill it
+ * from how the SAME merchant was already categorized elsewhere in your own
+ * ledger. No rule has to exist for this to work — it reads your own history.
+ *
+ * Requires a real majority (≥80% of that payee's categorized instances, and
+ * at least 2 of them) before acting. A payee split 50/50 between two
+ * categories is genuinely ambiguous (the same merchant covers two different
+ * kinds of purchase) and guessing wrong there is worse than leaving it blank,
+ * since a silently wrong category is harder to notice than an empty one.
+ */
+function historyFillCategories(silent) {
+  return withLock('history-fill', () => {
+    const txns = sheet_(SHEET_NAMES.TRANSACTIONS);
+    const nCols = TRANSACTIONS_SPEC.columns.length;
+    const cPayee = colOf(TRANSACTIONS_SPEC, 'payee');
+    const cCat = colOf(TRANSACTIONS_SPEC, 'category');
+    const data = txns.getRange(DATA_START_ROW, 1, DATA_ROWS, nCols).getValues();
+    const iPayee = cPayee - 1, iCat = cCat - 1;
+
+    // Build normalizedPayee -> {category: count} from everything already
+    // categorized, regardless of source (manual, import, sample, bank sync).
+    const tally = {};
+    data.forEach(r => {
+      const payee = String(r[iPayee] || '').trim();
+      const cat = r[iCat];
+      if (!payee || !cat) return;
+      const key = normalizePayee(payee);
+      if (!key) return;
+      (tally[key] || (tally[key] = {}))[cat] = ((tally[key] || {})[cat] || 0) + 1;
+    });
+
+    const dominant = {};
+    Object.keys(tally).forEach(key => {
+      const counts = tally[key];
+      const total = Object.values(counts).reduce((a, b) => a + b, 0);
+      const [topCat, topCount] = Object.entries(counts).sort((a, b) => b[1] - a[1])[0];
+      if (total >= 2 && topCount / total >= 0.8) dominant[key] = topCat;
+    });
+
+    let filled = 0;
+    data.forEach(r => {
+      if (r[iCat] !== '' && r[iCat] !== null) return;
+      const payee = String(r[iPayee] || '').trim();
+      if (!payee) return;
+      const guess = dominant[normalizePayee(payee)];
+      if (!guess) return;
+      r[iCat] = guess;
+      filled++;
+    });
+
+    if (filled) {
+      txns.getRange(DATA_START_ROW, cCat, DATA_ROWS, 1).setValues(data.map(r => [r[iCat]]));
+    }
+
+    if (!silent) {
+      ss_().toast(`${filled} transaction(s) categorized from your own history.`,
+        '🧠 History fill', 6);
+    }
+    blog(`historyFillCategories: ${filled} filled`);
+    return filled;
+  });
+}
+
+/**
+ * Turns consistent manual categorization into durable Rules tab entries, so
+ * a merchant you've corrected a few times never needs correcting again —
+ * including on a device or a future sync where the ledger history this run
+ * depends on may not yet exist.
+ *
+ * Only proposes; nothing is written without confirmation, matching
+ * detectRecurring()'s pattern. Skips any payee an ACTIVE rule already covers,
+ * so this does not create redundant or conflicting rules over time.
+ */
+function generateRulesFromHistory() {
+  return withLock('rules-from-history', () => {
+    const ui = SpreadsheetApp.getUi();
+    const txns = sheet_(SHEET_NAMES.TRANSACTIONS);
+    const rulesSheet = sheet_(SHEET_NAMES.RULES);
+
+    const nCols = TRANSACTIONS_SPEC.columns.length;
+    const cPayee = colOf(TRANSACTIONS_SPEC, 'payee') - 1;
+    const cCat = colOf(TRANSACTIONS_SPEC, 'category') - 1;
+    const data = txns.getRange(DATA_START_ROW, 1, DATA_ROWS, nCols).getValues();
+
+    const tally = {}; // normalizedPayee -> { display, counts: {cat: n} }
+    data.forEach(r => {
+      const payee = String(r[cPayee] || '').trim();
+      const cat = r[cCat];
+      if (!payee || !cat) return;
+      const key = normalizePayee(payee);
+      if (!key) return;
+      if (!tally[key]) tally[key] = { display: payee, counts: {} };
+      tally[key].counts[cat] = (tally[key].counts[cat] || 0) + 1;
+    });
+
+    const existingRules = rulesSheet.getRange(DATA_START_ROW, 1, DATA_ROWS, 9).getValues()
+      .filter(r => r[6] === true || r[6] === 'TRUE')
+      .map(r => ({ matchType: String(r[1] || 'Contains'), matchText: String(r[2] || '') }));
+    const alreadyRuled = key => existingRules.some(rule =>
+      matchesRule(key, { matchType: rule.matchType, matchText: normalizePayee(rule.matchText) }));
+
+    const MIN_OCCURRENCES = 3;
+    const MIN_CONSENSUS = 0.85;
+    const proposals = [];
+    Object.keys(tally).forEach(key => {
+      const { display, counts } = tally[key];
+      const total = Object.values(counts).reduce((a, b) => a + b, 0);
+      if (total < MIN_OCCURRENCES) return;
+      const [topCat, topCount] = Object.entries(counts).sort((a, b) => b[1] - a[1])[0];
+      if (topCount / total < MIN_CONSENSUS) return;
+      if (alreadyRuled(key)) return;
+      proposals.push({ key, display, category: topCat, count: total });
+    });
+
+    if (!proposals.length) {
+      ui.alert('Nothing new to propose',
+        `A payee needs ${MIN_OCCURRENCES}+ categorized transactions with ${Math.round(MIN_CONSENSUS * 100)}%+ ` +
+        `agreement on the category, and no active rule already covering it.\n\n` +
+        `Either your ledger is thin so far, or Rules already covers everything consistent.`, ui.ButtonSet.OK);
+      return 0;
+    }
+
+    proposals.sort((a, b) => b.count - a.count);
+    const preview = proposals.slice(0, 15)
+      .map(p => `  "${p.display}" → ${p.category}  (${p.count}x)`).join('\n');
+
+    const ans = ui.alert(`Propose ${proposals.length} new rule(s)`,
+      `${preview}${proposals.length > 15 ? `\n  …and ${proposals.length - 15} more` : ''}\n\n` +
+      `Add these to the Rules tab, active, so future syncs categorize them automatically?\n` +
+      `Nothing already on the Rules tab is changed.`, ui.ButtonSet.YES_NO);
+    if (ans !== ui.Button.YES) return 0;
+
+    const priorityCol = colOf(RULES_SPEC, 'priority');
+    const existingPriorities = readColumn(rulesSheet, priorityCol).map(Number).filter(n => !isNaN(n));
+    let nextPriority = (existingPriorities.length ? Math.max.apply(null, existingPriorities) : 0) + 10;
+
+    const start = firstEmptyRow(rulesSheet, priorityCol);
+    const block = proposals.map(p => {
+      const row = [nextPriority, 'Contains', p.display, p.category, '', '', true, 0,
+        `Auto-generated from ${p.count} consistently-categorized transaction(s).`];
+      nextPriority += 10;
+      return row;
+    });
+    rulesSheet.getRange(start, 1, block.length, 9).setValues(block);
+
+    ss_().toast(`${proposals.length} rule(s) added — future syncs will categorize these automatically.`,
+      '🧠 Rules generated', 6);
+    blog(`generateRulesFromHistory: ${proposals.length} proposed`);
+    return proposals.length;
   });
 }
 
@@ -436,13 +609,14 @@ function importStagedRows() {
     while (statuses.length < DATA_ROWS) statuses.push(['']);
     staging.getRange(DATA_START_ROW, statusCol, DATA_ROWS, 1).setValues(statuses);
 
-    if (imported) applyRules();
+    let cat = { rules: 0, history: 0 };
+    if (imported) cat = autoCategorizeTransactions(true);
 
     ui.alert('Import complete',
       `Imported:   ${imported}\n` +
       `Duplicates: ${dupes}\n` +
       `Errors:     ${errors}\n\n` +
-      (imported ? 'Categorization rules were applied to the new rows.\n\n' : '') +
+      (imported ? `Categorized automatically: ${cat.rules} by rule, ${cat.history} from your history.\n\n` : '') +
       'Per-row detail is in the Status column. Clear the staging rows when you are happy with them.',
       ui.ButtonSet.OK);
 
@@ -487,101 +661,135 @@ function readColumn(sheet, col) {
 // ============================================================================
 
 /**
- * Finds repeating charges in the ledger and proposes Recurring entries.
+ * Finds repeating INFLOWS and OUTFLOWS in the ledger — bills and
+ * subscriptions, but also paychecks and other recurring deposits — and
+ * returns proposed Recurring entries. Pure computation, no UI and no writes,
+ * so it is safe to call from an automatic sync just to get a count.
  *
- * The heuristic: same payee, at least 3 charges in the last 12 months, and a
- * MEDIAN gap between them that lands near a known cadence. Median rather than
- * mean because one skipped or double-billed month should not drag the estimate
- * — that is exactly the noise this is meant to see through.
+ * The heuristic: same payee and direction, at least 3 occurrences in the last
+ * 12 months, a MEDIAN gap that lands near a known cadence, and stable
+ * amounts. Median rather than mean because one skipped or double-billed
+ * month (or a bonus paycheck) should not drag the estimate — that is exactly
+ * the noise this is meant to see through.
  *
- * It proposes; it does not decide. New entries land with status Watch so they
- * are visibly unreviewed, and nothing already on the tab is modified.
+ * Income gets a wider amount-stability tolerance than bills: overtime and
+ * bonuses move a paycheck by more than a subscription price ever should, and
+ * treating a paycheck like a fixed subscription charge would reject every
+ * real paycheck history that includes a single big or small week.
+ */
+function computeRecurringProposals() {
+  const txns = sheet_(SHEET_NAMES.TRANSACTIONS);
+  const rec = sheet_(SHEET_NAMES.RECURRING);
+
+  const nCols = TRANSACTIONS_SPEC.columns.length;
+  const data = txns.getRange(DATA_START_ROW, 1, DATA_ROWS, nCols).getValues();
+  const iDate = colOf(TRANSACTIONS_SPEC, 'date') - 1;
+  const iPayee = colOf(TRANSACTIONS_SPEC, 'payee') - 1;
+  const iAmt = colOf(TRANSACTIONS_SPEC, 'amount') - 1;
+  const iCat = colOf(TRANSACTIONS_SPEC, 'category') - 1;
+  const iAcct = colOf(TRANSACTIONS_SPEC, 'account') - 1;
+  const iType = colOf(TRANSACTIONS_SPEC, 'type') - 1;
+
+  const cutoff = new Date();
+  cutoff.setFullYear(cutoff.getFullYear() - 1);
+
+  const groups = {};
+  data.forEach(r => {
+    const d = r[iDate];
+    if (!(d instanceof Date) || d < cutoff) return;
+    if (r[iType] === TXN_TYPES.TRANSFER) return;
+    const payee = String(r[iPayee] || '').trim();
+    if (!payee) return;
+    const direction = Number(r[iAmt]) >= 0 ? 'in' : 'out';
+    // Direction is part of the key: the same merchant name can plausibly
+    // appear as both a charge and a refund, and those are different rhythms.
+    const key = normalizePayee(payee) + '|' + direction;
+    if (!groups[key]) groups[key] = { payee, direction, rows: [] };
+    groups[key].rows.push({
+      date: d, amount: Math.abs(Number(r[iAmt])),
+      category: r[iCat], account: r[iAcct],
+    });
+  });
+
+  const existing = {};
+  readColumn(rec, colOf(RECURRING_SPEC, 'name')).forEach(n => { existing[normalizePayee(n)] = true; });
+  readColumn(rec, colOf(RECURRING_SPEC, 'match')).forEach(n => { existing[normalizePayee(n)] = true; });
+
+  const proposals = [];
+  Object.keys(groups).forEach(key => {
+    const g = groups[key];
+    if (existing[normalizePayee(g.payee)]) return;
+    if (g.rows.length < 3) return;
+
+    g.rows.sort((a, b) => a.date - b.date);
+    const gaps = [];
+    for (let i = 1; i < g.rows.length; i++) {
+      gaps.push(Math.round((g.rows[i].date - g.rows[i - 1].date) / 86400000));
+    }
+    const gap = median(gaps);
+    const cadence = cadenceForGap(gap);
+    if (!cadence) return;
+
+    const amounts = g.rows.map(r => r.amount);
+    const amt = median(amounts);
+    const spread = (Math.max.apply(null, amounts) - Math.min.apply(null, amounts)) / (amt || 1);
+    const tolerance = g.direction === 'in' ? 0.5 : 0.35;
+    if (spread > tolerance) return;
+
+    // Category: majority vote from however these rows have already been
+    // categorized, same rule as historyFillCategories — a rough guess, not a
+    // hard assignment, and always overridable on the Recurring tab itself.
+    const catCounts = {};
+    g.rows.forEach(r => { if (r.category) catCounts[r.category] = (catCounts[r.category] || 0) + 1; });
+    const catEntries = Object.entries(catCounts).sort((a, b) => b[1] - a[1]);
+    const category = catEntries.length ? catEntries[0][0] : '';
+
+    const last = g.rows[g.rows.length - 1];
+    const next = new Date(last.date.getTime() + gap * 86400000);
+
+    proposals.push({
+      name: g.payee, match: g.payee, amount: round2(amt), cadence, next,
+      account: last.account, category, count: g.rows.length, direction: g.direction,
+    });
+  });
+
+  proposals.sort((a, b) => b.amount * CADENCE_PER_YEAR[b.cadence] - a.amount * CADENCE_PER_YEAR[a.cadence]);
+  return proposals;
+}
+
+/**
+ * UI wrapper around computeRecurringProposals(): shows what was found and
+ * inserts only on confirmation. Nothing already on the Recurring tab is
+ * modified, and new entries land with status Watch so they stay visibly
+ * unreviewed until you look at them.
  */
 function detectRecurring() {
   return withLock('detect', () => {
     const ui = SpreadsheetApp.getUi();
-    const txns = sheet_(SHEET_NAMES.TRANSACTIONS);
     const rec = sheet_(SHEET_NAMES.RECURRING);
-
-    const nCols = TRANSACTIONS_SPEC.columns.length;
-    const data = txns.getRange(DATA_START_ROW, 1, DATA_ROWS, nCols).getValues();
-    const iDate = colOf(TRANSACTIONS_SPEC, 'date') - 1;
-    const iPayee = colOf(TRANSACTIONS_SPEC, 'payee') - 1;
-    const iAmt = colOf(TRANSACTIONS_SPEC, 'amount') - 1;
-    const iCat = colOf(TRANSACTIONS_SPEC, 'category') - 1;
-    const iAcct = colOf(TRANSACTIONS_SPEC, 'account') - 1;
-    const iType = colOf(TRANSACTIONS_SPEC, 'type') - 1;
-
-    const cutoff = new Date();
-    cutoff.setFullYear(cutoff.getFullYear() - 1);
-
-    const groups = {};
-    data.forEach(r => {
-      const d = r[iDate];
-      if (!(d instanceof Date) || d < cutoff) return;
-      if (Number(r[iAmt]) >= 0) return;                       // outflows only
-      if (r[iType] === TXN_TYPES.TRANSFER) return;
-      const payee = String(r[iPayee] || '').trim();
-      if (!payee) return;
-      const key = normalizePayee(payee);
-      if (!groups[key]) groups[key] = { payee, rows: [] };
-      groups[key].rows.push({
-        date: d, amount: Math.abs(Number(r[iAmt])),
-        category: r[iCat], account: r[iAcct],
-      });
-    });
-
-    const existing = {};
-    readColumn(rec, colOf(RECURRING_SPEC, 'name')).forEach(n => { existing[normalizePayee(n)] = true; });
-    readColumn(rec, colOf(RECURRING_SPEC, 'match')).forEach(n => { existing[normalizePayee(n)] = true; });
-
-    const proposals = [];
-    Object.keys(groups).forEach(key => {
-      if (existing[key]) return;
-      const g = groups[key];
-      if (g.rows.length < 3) return;
-
-      g.rows.sort((a, b) => a.date - b.date);
-      const gaps = [];
-      for (let i = 1; i < g.rows.length; i++) {
-        gaps.push(Math.round((g.rows[i].date - g.rows[i - 1].date) / 86400000));
-      }
-      const gap = median(gaps);
-      const cadence = cadenceForGap(gap);
-      if (!cadence) return;
-
-      // Amounts must be roughly stable, or this is just a frequented merchant
-      // (a grocery store) rather than a subscription.
-      const amounts = g.rows.map(r => r.amount);
-      const amt = median(amounts);
-      const spread = (Math.max.apply(null, amounts) - Math.min.apply(null, amounts)) / (amt || 1);
-      if (spread > 0.35) return;
-
-      const last = g.rows[g.rows.length - 1];
-      const next = new Date(last.date.getTime() + gap * 86400000);
-
-      proposals.push({
-        name: g.payee, match: g.payee, amount: round2(amt), cadence, next,
-        account: last.account, category: last.category, count: g.rows.length,
-      });
-    });
+    const proposals = computeRecurringProposals();
 
     if (!proposals.length) {
-      ui.alert('No new recurring charges found',
-        'Detection needs at least 3 charges from the same payee in the last 12 months, ' +
-        'spaced at a regular cadence, with amounts within ±35%.\n\n' +
+      ui.alert('Nothing new found',
+        'Detection needs at least 3 occurrences from the same payee and direction in the ' +
+        'last 12 months, spaced at a regular cadence, with stable amounts (±35% for bills, ' +
+        '±50% for income, since paychecks move more than subscription prices do).\n\n' +
         'Anything already on the Recurring tab is skipped.', ui.ButtonSet.OK);
       return 0;
     }
 
-    proposals.sort((a, b) => b.amount * CADENCE_PER_YEAR[b.cadence] - a.amount * CADENCE_PER_YEAR[a.cadence]);
     const preview = proposals.slice(0, 15)
-      .map(p => `  ${p.name} — ${p.cadence} ${formatMoney(p.amount)} ` +
-                `(${formatMoney(p.amount * CADENCE_PER_YEAR[p.cadence])}/yr, ${p.count} charges)`)
+      .map(p => `  ${p.direction === 'in' ? '+' : '−'} ${p.name} — ${p.cadence} ${formatMoney(p.amount)} ` +
+                `(${formatMoney(p.amount * CADENCE_PER_YEAR[p.cadence])}/yr, ${p.count}x` +
+                `${p.category ? `, → ${p.category}` : ''})`)
       .join('\n');
 
-    const ans = ui.alert(`Found ${proposals.length} recurring charge(s)`,
+    const incomeCount = proposals.filter(p => p.direction === 'in').length;
+    const ans = ui.alert(`Found ${proposals.length} recurring item(s)`,
       `${preview}${proposals.length > 15 ? `\n  …and ${proposals.length - 15} more` : ''}\n\n` +
+      (incomeCount ? `${incomeCount} of these look like recurring INCOME (paychecks, deposits), ` +
+        `not bills. Adding them lets the Dashboard total your expected annual income from ` +
+        `whatever it finds, alongside your bills.\n\n` : '') +
       `Add these to the Recurring tab with status "Watch"?\n` +
       `Nothing already on that tab will be changed.`, ui.ButtonSet.YES_NO);
     if (ans !== ui.Button.YES) return 0;
@@ -593,9 +801,9 @@ function detectRecurring() {
     rec.getRange(start, 1, block.length, 8).setValues(block);
     rec.getRange(start, colOf(RECURRING_SPEC, 'nextdue'), block.length, 1).setNumberFormat(DATE_FORMAT);
     rec.getRange(start, colOf(RECURRING_SPEC, 'notes'), block.length, 1)
-      .setValue('Auto-detected — review the amount and cadence, then set the status.');
+      .setValue('Auto-detected — review the amount, cadence and category, then set the status.');
 
-    ss_().toast(`${proposals.length} recurring charge(s) added with status "Watch".`,
+    ss_().toast(`${proposals.length} recurring item(s) added with status "Watch".`,
       '🔁 Detection complete', 6);
     blog(`detectRecurring: ${proposals.length} proposed`);
     return proposals.length;
