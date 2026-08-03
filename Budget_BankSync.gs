@@ -98,7 +98,8 @@ function buildBankSyncMenu(ui) {
     .addItem('🔗  Connect to your bank…', 'connectBank')
     .addItem('🧩  Link accounts to this workbook', 'linkBankAccounts')
     .addSeparator()
-    .addItem('⬇️  Sync transactions now', 'syncBank')
+    .addItem('⏳  Sync ALL history (run once, after linking)', 'syncBankFullHistory')
+    .addItem('⬇️  Sync new transactions', 'syncBank')
     .addItem('💵  Refresh balances only', 'syncBalancesOnly')
     .addSeparator()
     .addItem('ℹ️  Connection status', 'showBankStatus')
@@ -292,7 +293,11 @@ function sfGetAccounts(startDate, endDate, withTransactions) {
   // the legacy shape, where the fields below are named differently.
   const params = { version: 2 };
   if (withTransactions) {
-    params['start-date'] = Math.floor(startDate.getTime() / 1000);
+    // startDate === null means "no start-date at all" — the protocol treats
+    // an omitted start-date as unrestricted, i.e. every transaction the
+    // Bridge has cached for that account. That is the ALL-TIME sync; a real
+    // Date means the normal incremental window.
+    if (startDate) params['start-date'] = Math.floor(startDate.getTime() / 1000);
     if (endDate) params['end-date'] = Math.floor(endDate.getTime() / 1000);
     // NOT requesting pending. Pending rows are excluded by default and that is
     // what we want — they change amount and description before settling, so a
@@ -463,18 +468,73 @@ function guessAccountType(acct) {
 // ============================================================================
 
 /**
- * Pulls transactions and appends the ones we have not seen.
+ * Normal sync: fetch new transactions since last time and append the ones we
+ * have not seen. This is the one to run routinely — daily, weekly, whenever.
  *
- * Dedupe is on the PROVIDER'S transaction id, which is strictly better than
- * the content hash used for CSV import: the bank assigns it, so two identical
- * charges on the same day at the same merchant remain distinguishable. The
- * hash path still exists for CSV rows, which have no stable id.
+ * "New" is deliberately not "strictly after the last sync." A card charge can
+ * post days after it happened and lands dated BEHIND the last sync
+ * timestamp, so the fetch window re-covers the last SF_OVERLAP_DAYS on every
+ * run. That overlap is what makes "fetch new ones" safe to say plainly:
+ * dedupe on the provider's transaction id (see runBankSync_) makes the
+ * redundant re-fetch free, so nothing is ever double-added, and nothing late
+ * is ever missed.
  *
- * Pending transactions are skipped. They change amount and description before
- * settling and a pending row would either duplicate or contradict its own
- * settled version a day later.
+ * First run ever (no stored last-sync time) falls back to a 90-day window,
+ * not full history — run 🏦 Bank Sync ▸ Sync ALL history first if you want
+ * everything the Bridge has.
  */
 function syncBank() {
+  const lastSync = sfProps().getProperty(SF_LAST_SYNC_KEY);
+  const start = new Date();
+  if (lastSync) {
+    start.setTime(Number(lastSync));
+    start.setDate(start.getDate() - SF_OVERLAP_DAYS);
+  } else {
+    start.setDate(start.getDate() - SF_INITIAL_LOOKBACK_DAYS);
+  }
+  return runBankSync_(start, false);
+}
+
+/**
+ * One-time full-history pull: fetches every transaction the Bridge has
+ * cached for each linked account, with NO start-date restriction at all
+ * (see sfGetAccounts — startDate === null omits the parameter entirely,
+ * which the protocol treats as unrestricted).
+ *
+ * Safe to run more than once, and safe to run alongside regular syncBank():
+ * dedupe is on the provider's transaction id, so re-fetching a range that
+ * overlaps — or duplicates — everything already synced just re-confirms it,
+ * never re-adds it. There is no reason to run this a second time except to
+ * pull in an account you linked after the first full sync.
+ *
+ * How far back "all history" actually reaches depends entirely on your bank
+ * and the Bridge, typically anywhere from several months to a few years —
+ * this requests everything available, it cannot request more than that.
+ */
+function syncBankFullHistory() {
+  const ui = SpreadsheetApp.getUi();
+  const ans = ui.alert('Sync ALL history',
+    'This fetches every transaction your bank/Bridge has cached for each linked ' +
+    'account — could be a few months, could be a few years, depending on your bank.\n\n' +
+    'It can take a while and may pull in a large batch at once. Safe to run more than ' +
+    'once; anything already in the ledger is skipped by its bank transaction ID, never ' +
+    'duplicated.\n\nContinue?', ui.ButtonSet.YES_NO);
+  if (ans !== ui.Button.YES) return 0;
+  return runBankSync_(null, true);
+}
+
+/**
+ * Shared core for both sync entry points above. Dedupe is on the PROVIDER'S
+ * transaction id, which is strictly better than the content hash used for
+ * CSV import: the bank assigns it, so two identical charges on the same day
+ * at the same merchant remain distinguishable. The hash path still exists
+ * for CSV rows, which have no stable id.
+ *
+ * Pending transactions are skipped. They change amount and description
+ * before settling and a pending row would either duplicate or contradict its
+ * own settled version a day later.
+ */
+function runBankSync_(startDate, isFullHistory) {
   const ui = SpreadsheetApp.getUi();
   if (!sfIsConnected()) {
     ui.alert('Not connected. Run 🏦 Bank Sync ▸ Connect to your bank first.');
@@ -502,26 +562,21 @@ function syncBank() {
       return 0;
     }
 
-    // --- Window. Overlap on every run but the first; see SF_OVERLAP_DAYS.
-    const lastSync = sfProps().getProperty(SF_LAST_SYNC_KEY);
-    const start = new Date();
-    if (lastSync) {
-      start.setTime(Number(lastSync));
-      start.setDate(start.getDate() - SF_OVERLAP_DAYS);
-    } else {
-      start.setDate(start.getDate() - SF_INITIAL_LOOKBACK_DAYS);
-    }
-
-    ss_().toast('Contacting your bank…', '🏦 Bank Sync', -1);
+    ss_().toast(
+      isFullHistory ? 'Fetching full history — this may take a moment…' : 'Contacting your bank…',
+      '🏦 Bank Sync', -1);
     let data;
     try {
-      data = sfGetAccounts(start, null, true);
+      data = sfGetAccounts(startDate, null, true);
     } catch (err) {
       ui.alert('Sync failed', String(err.message || err), ui.ButtonSet.OK);
       return 0;
     }
 
-    // --- Existing provider ids.
+    // --- Existing provider ids. This is the entire "only fetch what we don't
+    // already have" mechanism: the window above decides what to ASK for, this
+    // set decides what actually gets WRITTEN, and the two are independent —
+    // asking for an overlapping or fully-redundant range is always safe.
     const cBankId = colOf(TRANSACTIONS_SPEC, 'bankid');
     const seen = {};
     txns.getRange(DATA_START_ROW, cBankId, DATA_ROWS, 1).getValues()
@@ -579,8 +634,8 @@ function syncBank() {
 
       const startRow = firstEmptyRow(txns, colOf(TRANSACTIONS_SPEC, 'date'));
       if (startRow + toAppend.length > DATA_START_ROW + DATA_ROWS) {
-        ui.alert(`The ledger holds ${DATA_ROWS} rows and this sync would exceed it. ` +
-          `Archive older transactions first.`);
+        ui.alert(`The ledger holds ${DATA_ROWS} rows and this sync would add ${toAppend.length} more, ` +
+          `which exceeds it. Raise DATA_ROWS or archive older transactions first.`);
         return 0;
       }
       TRANSACTIONS_SPEC.columns.forEach((c, i) => {
@@ -606,7 +661,7 @@ function syncBank() {
     }
 
     const errs = (data.__errors || []).length;
-    ui.alert('Sync complete',
+    ui.alert(isFullHistory ? 'Full history sync complete' : 'Sync complete',
       `New transactions:  ${imported}\n` +
       `Pending (skipped): ${pendingSkipped}\n` +
       `Unlinked accounts: ${unmapped}\n` +
@@ -620,7 +675,7 @@ function syncBank() {
       'as-of date is wrong — not the ledger.',
       ui.ButtonSet.OK);
 
-    blog(`bank: synced ${imported}, pending ${pendingSkipped}, unmapped ${unmapped}`);
+    blog(`bank: synced ${imported} (fullHistory=${!!isFullHistory}), pending ${pendingSkipped}, unmapped ${unmapped}`);
     return imported;
   });
 }

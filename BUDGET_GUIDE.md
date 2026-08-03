@@ -173,6 +173,33 @@ position.
 
 ---
 
+## Bank sync (SimpleFIN Bridge)
+
+Connect once at [bridge.simplefin.org](https://bridge.simplefin.org) — you authenticate
+with your bank there, never in this spreadsheet — then `🏦 Bank Sync ▸ Connect to your
+bank…`, paste the setup token, and link accounts.
+
+Two sync actions, and the difference matters:
+
+- **⏳ Sync ALL history** — run this **once**, right after linking. It fetches
+  everything the Bridge has cached for each account, with no date restriction at all.
+  How far back that actually reaches depends on your bank — anywhere from a few months
+  to a few years.
+- **⬇️ Sync new transactions** — the one to run routinely afterward. It fetches
+  since your last sync (with a 10-day overlap, because a card charge can post days
+  late and lands dated *behind* when you last synced) and appends only what it hasn't
+  seen before.
+
+Both are safe to run repeatedly, including full history a second time: **dedupe is on
+the bank's own transaction ID**, not on the fetch window, so an overlapping or fully
+redundant fetch just re-confirms what's already there — it never duplicates. That's
+what makes "sync new transactions" simple to reason about: the window only decides
+what to *ask for*; the ID check decides what actually gets *written*, and those are
+independent.
+
+Every sync auto-categorizes new rows and silently checks for new recurring bills or
+income (see below) — nothing there requires a menu click either.
+
 ## Importing transactions
 
 1. Export CSV from your bank.
