@@ -72,6 +72,16 @@ const SF_INITIAL_LOOKBACK_DAYS = 90;
  */
 const SF_OVERLAP_DAYS = 10;
 
+/**
+ * The "beginning of time" marker for a full-history sync — 1 second after the
+ * Unix epoch, not 0. Deliberately non-zero: some server-side implementations
+ * treat a falsy 0 the same as "not provided," which is exactly the bug this
+ * constant exists to dodge. A start-date this early requests literally every
+ * transaction the Bridge has ever cached for an account; it can never
+ * request MORE history than that, so there is no real number to tune here.
+ */
+const SF_EPOCH_START = new Date(1000);
+
 function sfProps() {
   return PropertiesService.getScriptProperties();
 }
@@ -293,11 +303,13 @@ function sfGetAccounts(startDate, endDate, withTransactions) {
   // the legacy shape, where the fields below are named differently.
   const params = { version: 2 };
   if (withTransactions) {
-    // startDate === null means "no start-date at all" — the protocol treats
-    // an omitted start-date as unrestricted, i.e. every transaction the
-    // Bridge has cached for that account. That is the ALL-TIME sync; a real
-    // Date means the normal incremental window.
-    if (startDate) params['start-date'] = Math.floor(startDate.getTime() / 1000);
+    // ALWAYS send start-date, even for "all time." The protocol document
+    // reads as if omitting it means "unrestricted," but the Bridge in
+    // practice returns EMPTY transaction arrays with no start-date at all —
+    // confirmed empirically (0 new/0 pending/0 skipped on every linked
+    // account). SF_EPOCH_START below is the "beginning of time" marker for a
+    // full-history pull; it is never omitted.
+    params['start-date'] = Math.floor(startDate.getTime() / 1000);
     if (endDate) params['end-date'] = Math.floor(endDate.getTime() / 1000);
     // NOT requesting pending. Pending rows are excluded by default and that is
     // what we want — they change amount and description before settling, so a
@@ -497,9 +509,12 @@ function syncBank() {
 
 /**
  * One-time full-history pull: fetches every transaction the Bridge has
- * cached for each linked account, with NO start-date restriction at all
- * (see sfGetAccounts — startDate === null omits the parameter entirely,
- * which the protocol treats as unrestricted).
+ * cached for each linked account, using SF_EPOCH_START — 1 second after the
+ * Unix epoch — as the start-date. An earlier version of this omitted
+ * start-date entirely on the theory that the protocol treats a missing
+ * value as unrestricted; in practice the Bridge returned EMPTY transaction
+ * arrays with no start-date at all. Sending an explicit, deliberately
+ * ancient date is what actually returns everything.
  *
  * Safe to run more than once, and safe to run alongside regular syncBank():
  * dedupe is on the provider's transaction id, so re-fetching a range that
@@ -520,7 +535,7 @@ function syncBankFullHistory() {
     'once; anything already in the ledger is skipped by its bank transaction ID, never ' +
     'duplicated.\n\nContinue?', ui.ButtonSet.YES_NO);
   if (ans !== ui.Button.YES) return 0;
-  return runBankSync_(null, true);
+  return runBankSync_(SF_EPOCH_START, true);
 }
 
 /**
